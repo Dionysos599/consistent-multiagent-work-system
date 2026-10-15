@@ -1,0 +1,20 @@
+Origin of this repository
+-------------------------
+The replicated key/value store components in this repository started as
+coursework for CSE 452 (Distributed Systems), University of Washington,
+Spring 2025. Some components were first developed jointly with a classmate.
+Both parties agreed that the work in this repository is maintained as the
+author's individual project; the original shared coursework repository is kept
+separately.
+
+Test harness and framework
+--------------------------
+The directory `jars/` contains the binaries of the course-provided testing
+framework ("dslabs") and its dependencies, and `run-tests.py` is a course-provided
+script (original author header preserved). These are the property of their
+respective authors, are NOT covered by any licence granted for the rest of this
+repository, and are included only so that the tests can be run locally.
+Third-party dependency licences are listed in `jars/THIRD-PARTY-NOTICES.txt`.
+
+Because the harness is course material, this repository is private and is not
+to be redistributed together with those binaries.
