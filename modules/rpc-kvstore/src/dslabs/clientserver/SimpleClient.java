@@ -45,7 +45,7 @@ class SimpleClient extends Node implements Client {
     this.currentCommand = command;
     this.result = null;
 
-    amoCommand = new AMOCommand(address(), seqNum, command);
+    amoCommand = new AMOCommand(command, seqNum, address());
 
     send(new Request(amoCommand), serverAddress);
     set(new ClientTimer(amoCommand), ClientTimer.CLIENT_RETRY_MILLIS);

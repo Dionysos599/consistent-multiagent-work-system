@@ -6,9 +6,9 @@ import lombok.Data;
 
 @Data
 public final class AMOCommand implements Command {
-  private final Address clientAddress;
-  private final int sequenceNum;
   private final Command command;
+  private final int sequenceNum;
+  private final Address sender;
 
   @Override
   public boolean readOnly() {

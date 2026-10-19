@@ -29,7 +29,7 @@ public final class AMOApplication<T extends Application> implements Application 
     }
 
     AMOCommand amoCommand = (AMOCommand) command;
-    Address clientAddress = amoCommand.clientAddress();
+    Address clientAddress = amoCommand.sender();
     int sequenceNum = amoCommand.sequenceNum();
 
     if (alreadyExecuted(amoCommand)) {
@@ -93,7 +93,7 @@ public final class AMOApplication<T extends Application> implements Application 
   }
 
   public boolean alreadyExecuted(AMOCommand amoCommand) {
-    Address clientAddress = amoCommand.clientAddress();
+    Address clientAddress = amoCommand.sender();
     int sequenceNum = amoCommand.sequenceNum();
 
     Map<Integer, Result> clientResults = results.get(clientAddress);
