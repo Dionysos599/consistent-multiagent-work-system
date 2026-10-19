@@ -1,10 +1,13 @@
 package dslabs.paxos;
 
+import dslabs.atmostonce.AMOCommand;
+import dslabs.atmostonce.AMOResult;
 import dslabs.framework.Address;
 import dslabs.framework.Client;
 import dslabs.framework.Command;
 import dslabs.framework.Node;
 import dslabs.framework.Result;
+import java.util.Objects;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 
@@ -12,8 +15,9 @@ import lombok.ToString;
 @EqualsAndHashCode(callSuper = true)
 public final class PaxosClient extends Node implements Client {
   private final Address[] servers;
-
-  // Your code here...
+  private int seqNum;
+  private AMOCommand pendingCommand;
+  private AMOResult pendingResult;
 
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
@@ -32,33 +36,51 @@ public final class PaxosClient extends Node implements Client {
    *  Client Methods
    * ---------------------------------------------------------------------------------------------*/
   @Override
-  public synchronized void sendCommand(Command operation) {
-    // Your code here...
+  public synchronized void sendCommand(Command command) {
+    pendingCommand = new AMOCommand(command, seqNum, address());
+    pendingResult = null;
+
+    // Broadcast request
+    broadcast(new PaxosRequest(pendingCommand), servers);
+    set(new ClientTimer(pendingCommand), ClientTimer.CLIENT_RETRY_MILLIS);
   }
 
   @Override
   public synchronized boolean hasResult() {
-    // Your code here...
-    return false;
+    return pendingResult != null;
   }
 
   @Override
   public synchronized Result getResult() throws InterruptedException {
-    // Your code here...
-    return null;
+    // Wait until we have a result
+    while (pendingResult == null) {
+      this.wait();
+    }
+    return pendingResult.result();
   }
 
   /* -----------------------------------------------------------------------------------------------
    * Message Handlers
    * ---------------------------------------------------------------------------------------------*/
   private synchronized void handlePaxosReply(PaxosReply m, Address sender) {
-    // Your code here...
+    if (pendingCommand != null && (m.result().sequenceNum() == pendingCommand.sequenceNum())) {
+      pendingResult = m.result();
+      seqNum++;
+      this.notify();
+    }
   }
 
   /* -----------------------------------------------------------------------------------------------
    *  Timer Handlers
    * ---------------------------------------------------------------------------------------------*/
   private synchronized void onClientTimer(ClientTimer t) {
-    // Your code here...
+    if (pendingCommand != null
+        && pendingResult == null
+        && Objects.equals(t.command(), pendingCommand)) { // Check if the command is still pending
+
+      // Broadcast request
+      broadcast(new PaxosRequest(pendingCommand), servers);
+      set(new ClientTimer(pendingCommand), ClientTimer.CLIENT_RETRY_MILLIS);
+    }
   }
 }
