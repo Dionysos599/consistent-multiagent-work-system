@@ -1,0 +1,339 @@
+# Design: Multi-Paxos Replicated State Machine
+
+*Authors: Hinyeung Lam*
+
+## Preface
+
+- **Goals:**
+    - Build a replicated state machine that process all client requests in the same order on all replicas using Paxos
+    - The system should make progress and maintain consistency even if some of the replicas are unavailable, or have unreliable network connections, or even if subsets of the replicas are isolated in their own network partitions.
+    - The system can continue to make progress as long as a majority of replicas are still alive. Replicas that were not in the majority can catch up later, getting the operations that they missed.
+    - Garbage collection for log command that has been executed by all replicas.
+- **Desired fault model:**
+    - The system is able to handle single server failure automatically as long as the amount of active servers is greater than the total number of servers. When the leader fails, the system is able to elect a new leader and continue with client’s requests. When a non-leader server fails, it has no effect on the system.
+    - The system can handle network failures automatically as long as messages aren’t corrupted. It ensures the system runs correctly when the networks drop, duplicate, delay or reorder messages.
+- **Challenges:**
+    - There can only be one leader in the system at a time.
+    - When a leader fails, the new leader needs to merge logs correctly in order to maintain linearizability and continue to make progress.
+    - All replicas need to have the same application state unless they crash.
+    - The system needs to work correctly even when the networks drop, duplicate, delay or reorder messages.
+    - Command in a log slot that has been executed by all replicas needs to be garbage collected.
+- **Assumptions:**
+    - A majority of servers are always alive, so consensus can be reached and progress can be made in the system.
+    - Only one outstanding request per client at a time.
+    - Servers fail by crashing, they fail permanently but not restart.
+    - The set of servers are fixed, so one cannot replace old servers.
+    - All replicas won’t crash at the same time since it stores neither the key/value database nor the Paxos state on disk.
+    - Networks can drop, delay, reorder, or duplicate messages, but some messages can be delivered between nodes to ensure minimal communication.
+
+## Protocol
+
+- **Kinds of node:**
+    - PaxosClient
+        - Always acts as a client, sends operations to all PaxosServer. Timers (ClientTimer) are also needed to enable retransmission of requests due to network errors or a change in leadership in the PaxosServer.
+        - There is no initialization necessary for the client node. It only needs to know its own address, the server address it will be talking to, and have the sequence number start at 0. Then, as it sends more requests, update the sequence number monotonically.
+    - PaxosServer
+        - Can play the role of leader or follower
+        - Role is determined by consensus during the scout phase
+        - The PaxosServer executes all operations from the last executed log slot up to the most recent non-chosen slot, following the order defined by the leader.
+        - Both leader and follower act as acceptor and replica.
+        - Leader
+            - Coordinate replicas consensus on client requests execution order, and directly respond to client with execution result
+            - Collect the global state and log of the system, Sends proposals to followers, decides the order in which requests are applied, and ensures all replicas apply updates consistently.
+            - Sends heartbeat messages to inform other followers of its active status
+            - Sends log updates along with the heartbeat messages to make sure all followers are catched up on the same chosen log slot command.
+            - Garbage collect log slot that has been executed by all replicas.
+            - The node must receive a majority of accept P1B in order to become the leader. When a server is elected as the leader, it takes control of the consensus process and sends accept requests to all other servers.
+            - If the leader receives a majority of accepted replies for a proposal, it marks the request as chosen.
+            - When the leader receives a request from a client, it puts the request into the next available log slot and sends an accept request to all followers.
+            - If a new leader is chosen, the new leader merges logs from other servers to ensure consistency.
+        - Follower
+            - Doesn't directly communicate with clients and will ignore any client messages it receives.
+            - Receives log updates from the leader with each HeartBeatRequest message. Maintains a log containing a sequence of commands that must be executed in a specific order.
+            - When a follower receives a P1A or P2A request from the leader, it checks the ballot number of the request. If the ballot number in the request is equal to or higher than the current ballot number stored by the follower, it accepts the request and sends a confirmation message back to the leader. Else, the follower should ignore or reject the request.
+            - Must receive regular heartbeat messages from the leader within a specified time interval to know the leader is still active.
+            - If a follower does not receive a heartbeat message within two CheckHeartBeatTimer ticks, it assumes the leader has failed and will initiate a new leader election process (Phase 1A).
+            - When an acceptor receives a leader proposal P1A request, it checks the ballot number in the proposal. If the new ballot number in the proposal is higher than the current ballot number stored by the follower, it votes for the new leader by sending a P1B message to the candidate.
+- **State at each kind of node:**
+    - PaxosClient
+        - Address[] servers
+            - List of server address
+            - Fixed at initialization
+        - int seqNum
+            - Sequence number for client operations
+            - Initialized to 0
+            - Monotonically increasing
+        - AMOCommand pendingCommand
+            - The command currently waiting for a response
+            - Initialized to null
+            - Set when sendCommand is called to send client request
+        - AMOResult pendingResult
+            - The result of the pending command, if received
+            - Initialized to null
+            - Set when a valid reply is received from the primary
+    - PaxosServer
+        - Address[] servers
+            - List of server address
+            - Fixed at initialization
+        - AMOApplication app
+            - The application state for key-value storage
+            - Initialized as new instance
+            - Modified by operations if command in the all previous and current log slot is chosen
+        - **Ballot ballot_num:**
+            - The highest ballot received
+            - Class Ballot
+                - Int round_num
+                    - Initialized to 0
+                    - Set when it receives P1ARequest with higher ballot_num or monotonically increase when it’s trying to become the leader.
+                - Address server
+                    - Initialized to address of the server
+                    - Modified when it receives P1ARequest with higher ballot_num, or changes it back to the address of this server when trying to become the leader.
+        - Map\<Integer, LogEntry\> log
+            - The current status of the log with slot_num as key and log entry as value
+            - Class LogEntry
+                - Ballot ballot
+                    - ballot_num of the leader that made the proposal
+                    - Initialized to null
+                    - Set when it receives P2ARequest from the leader with matching ballot_num
+                - PaxosLogSlotStatus status
+                    - State of the proposal in the log slot
+                    - Initialized to empty
+                    - Set when it receives P2ARequest from the leader with matching ballot_num. It can also be modified to chosen or clear through HeartBeat.
+                - AMOCommand command
+                    - Client request proposed in the log slot
+                    - Initialized to null
+                    - Set when it receives P2ARequest from the leader with matching ballot_num
+        - **Map\<Integer, LogEntry\> temp_log:**
+            - Separate log structure used to merge log as P1B arrives
+            - Initialized to empty map
+            - Set to be the same state as the log before sending P2A
+            - Modify and merge log as P1B arrives. When a majority of P1B is received, update the log to be temp_log.
+        - Boolean Active
+            - Indicates whether the PaxosServer is the leader
+            - Initialized to false
+            - Reset to false when it receives P1A with higher ballot_num
+            - Set to true when it receives a majority of P1BResponse acceptance
+        - int FirstNotExec (slot_out)
+            - The earliest slot number for which a decision has not yet been reached, so the replica cannot execute it.
+            - Initialized to 1
+            - Increase when a majority of P2BResponse is received, consensus is reached, and command for a log slot is chosen. (all previous slot needs to be chose)
+        - int FirstEmpty (slot_in)
+            - The earliest slot number without a proposal
+            - Initialized to 1
+            - For leader: increases when a client request is received.
+            - For follower: increases when receives new P2A request for new slot from the leader
+        - Boolean isLeaderAlive
+            - Used by PaxosServer follower to indicates whether the PaxosServer leader is alive
+            - Initialized to false
+            - Reset to false every time the CheckHeartBeatTimer fires
+            - Set to true when it receives HeartBeatRequest from the leader
+        - Set\<Address\> P1BResponse
+            - Used by PaxosServer who wants to be the leader to record the servers that support it
+            - Initialized to empty set
+            - Add the P1B to the set when the P1B’s ballot_num matches the current PaxosServer’s ballot_num
+            - Reset when the PaxosServer receives a higher ballot_num, or the PaxosServer wants to elect with a higher ballot_num and increment the ballot_num itself
+        - Map\<Integer, Set\<Address\>\> P2BResponse
+            - Used by PaxosServer leader to keep track of the follower that has accepted its proposal for each log slot
+            - Initialized to empty map
+            - Update as it receives P2B with matching ballot_num
+        - Map\<Address, Integer\> GarbageCollect
+            - Used by PaxosServer leader to keep track of the follower’s FirstNotExec. The minimum value - 1 will be the slot that we can garbage collect up to
+            - Initialized to empty map
+            - Update as the leader receives HeartBeatReply from the follower
+- **Messages:**
+    - PaxosRequest
+        - **Source:** PaxosClient
+        - **Destination:** PaxosServer
+        - **Contents:** AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+        - When is it sent?
+            - Can be sent spontaneously by client when first time sending each individual requests
+            - Otherwise resend request when server didn’t respond before the ClientTimer fires
+        - What happens at the destination when it is received?
+            - If follower (active == false): ignore the client request
+            - If leader (active == true): check if already execute the request in the AMOapplication
+                - If executed: directly respond to the client
+                - If not executed: find the next available slot in the log using FirstEmpty (slot_in)and assign the request to the slot. Then initiate the commander process by sending P2A to all servers, and wait for all followers to reach consensus. After a majority of the followers have responded with P2B accept, the leader can execute the command (if all previous slot commands are chosen) and send the result back to the client.
+    - PaxosReply
+        - **Source:** PaxosServer (leader)
+        - **Destination:** PaxosClient
+        - **Contents:** AMOResult amoResult - execution result from the server (includes result, sequenceNum)
+        - When is it sent?
+            - Only sent spontaneously by leader when all PaxosServer have reach consensus on the client’s request log slot, and the leader has executed the corresponding client request
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - Client checks the reply’s sequenceNum matches its request’s sequenceNum. If they match, the reply is accepted and the client moves onto the next request. If they don’t match, the client ignores the reply
+    - P1A
+        - **Source:** PaxosServer (server attempts to be the leader (isLeaderAlive == false))
+        - **Destination:** PaxosServer (all)
+        - **Contents:** Ballot ballot_num - unique ID used for election (includes round_num and address of the proposer)
+        - When is it sent?
+            - During initialization when there is no leader.
+            - When the follower missed HeartBeat from the current leader for two CheckHeartBeatTimer ticks and believed the leader is dead (isLeaderAlvie == false).
+            - Otherwise resend P1A when server didn’t get majority of response before the P1ATimer fires
+        - What happens at the destination when it is received?
+            - PaxosServers compare the received ballot_num with their stored value
+                - If it’s not the leader and the received ballot_num is greater or equal to the store value, the servers accept the new leader's proposal, update the ballot_num to the greater value, promise not to accept any message with lower ballot_num, and reply with P1B.
+                - If it’s the leader and the received ballot_num is greater, step down by changing Active == false and reset P1BResponse, P2BResponse, and GargabeCollect. Then, accept the new leader's proposal, update the ballot_num to a greater value, promise not to accept any message with lower ballot_num, and reply with P1B.
+                - Else, the servers ignore the P1A.
+    - P1B
+        - **Source:** PaxosServer (follower/acceptor)
+        - **Destination:** PaxosServer (server attempts to be the leader who sent P1A)
+        - **Contents:**
+            - Ballot ballot_num - unique ID used for election (includes round_num and address of the proposer)
+            - Map\<Integer, LogEntry\> log - the entire log in the follower/acceptor
+        - When is it sent?
+            - Send in response of P1A
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - The PaxosServer check if the ballot_num matches
+                - If not match, ignore the message
+                - If matched, add the sender into P1BResponse, and the server starts merging log to temp_log until it receives a majority of P1B, then it informs the server that it has become the leader and updates temp_log to log. The server would then proceed to Phase 2, proposing command for log slot
+                    - During log merge, if a slot is chosen, update temp_log to the chosen value for the same slot. If we have two different values for the same slot, keep the one with higher ballot_num.
+                    - After log merge a majority of P1B but before transitioning temp_log to the leader’s log, check if there is any empty slot before the FirstEmpty (slot_in)and propose no-op for these empty slots.
+    - P2A
+        - **Source:** PaxosServer (leader)
+        - **Destination:** PaxosServer (all)
+        - **Contents:**
+            - Ballot ballot_num - unique ID used for election (includes round_num and address of the proposer)
+            - int slot_num - log slot for the accepted proposal
+            - AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+        - When is it sent?
+            - When the leader tries to propose a command for a slot in the log. This can be for a new command coming from the client request or trying to get a proposed command to be accepted by the majority of the followers
+            - Otherwise resend P2A when server didn’t get majority of response before the P2ATimer fire
+        - What happens at the destination when it is received?
+            - PaxosServers compare the received ballot_num with their stored value
+                - If it’s not the leader and the received ballot_num is greater or equal to the store value, the servers accept and store the leader's proposal, update the ballot_num to the greater value if necessary, promise not to accept any message with lower ballot_num, and reply with P2B.
+                - If it’s the leader and the received ballot_num is greater, step down by changing Active == false and reset P1BResponse, P2BResponse, and GargabeCollect. Then, the servers accept and store the leader's proposal, update the ballot_num to the greater value, promise not to accept any message with lower ballot_num, and reply with P2B.
+                - Else, the servers ignore the P2A.
+    - P2B
+        - **Source:** PaxosServer (follower/acceptor)
+        - **Destination:** PaxosServer (leader)
+        - **Contents:**
+            - Ballot ballot_num - unique ID used for election (includes round_num and address of the proposer)
+            - int slot_num - log slot for the accepted proposal
+        - When is it sent?
+            - Only sent in response to a P2A message
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - Check if the ballot_num matches
+            - If not match, ignore the message
+            - **If match:**
+                - Update the P2BResponses for this slot and check if a consensus is reached by the majority.
+                - Upon matching ballot majority: marks slot CHOSEN, updates FirstNotExec, executes commands sequentially, and sends client results
+    - HeartBeatRequest
+        - **Source:** PaxosServer (leader)
+        - **Destination:** PaxosServer (all)
+        - **Contents:**
+            - Ballot ballot_num - unique ID used for election (includes round_num and address of the proposer)
+            - Map\<Integer, LogEntry\> log - log to be iterated, which provides chosen commands for log slots that followers might have missed
+            - int firstNotCleared - lowest log slot that hasn’t been garbage collected
+        - When is it sent?
+            - Sent periodically by leader when HeartBeatTimer fires
+            - Cannot be sent spontaneously by non-leaders
+        - What happens at the destination when it is received?
+            - PaxosServers compare the received ballot_num with their stored value
+            - If the received ballot_num is smaller, ignore the message
+            - If it’s not the leader and the received ballot_num is greater or equal to the store value:
+                - Update the ballot_num
+                - Sets isLeaderAlive = true
+                - Updates log with missing chosen commands and update FirstNotExec
+                - Garbage collection up to the firstNotCleared slot
+                - Responds with HeartBeatReply
+            - If it’s the leader and the received ballot_num is greater or equal to the store value,:
+                - Update the ballot_num
+                - Sets isLeaderAlive = true
+                - Updates log with missing chosen commands and update FirstNotExec
+                - Garbage collection up to the firstNotCleared slot
+                - Responds with HeartBeatReply
+                - Step down by changing Active == false and reset P1BResponse, P2BResponse, and GargabeCollect
+    - HeartBeatReply
+        - **Source:** PaxosServer (follower/acceptor)
+        - **Destination:** PaxosServer (leader)
+        - **Contents:**
+            - Ballot ballot_num - unique ID used for election (includes round_num and address of the proposer)
+            - int FirstNotExec (slot_out) - first unexecuted slot number
+        - When is it sent?
+            - Only sent in response to a HeartBeatRequest
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - Check if the ballot_num matches
+            - If not match, ignore the message
+            - **If match:**
+                - Leader updates GarbageCollect with this follower’s FirstNotExec
+                - Calculates minimum executed slot across all servers once we have received responses from all PaxosServer
+                - Perform garbage collection if possible and updates firstNotCleared
+- **Timers:**
+    - ClientTimer
+        - Set by the PaxosClient
+        - **Contents:** int CLIENT_RETRY_MILLIS - time duration (100ms). AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+        - Set when PaxosClient sends request to all PaxosServer
+        - When it fires, if the PaxosClient didn’t receive the server reply and the current client’s request matches the command in the timer, the PaxosClient resends the request to all PaxosServer and reset the timer. Else, nothing is done
+    - P1ATimer
+        - Set by the PaxosServer (follower) who wants to become the new leader
+        - **Contents:**
+            - int P1A_RETRY_MILLIS - time duration (25ms).
+            - P1ARequest p1aRequest - the P1ARequest sent by the PaxosServer (follower) for election
+        - Set when the follower PaxosServer wants to become the new leader: during initialization or when the previous leader is dead.
+        - When it fires, if it hasn’t receive a majority of P1B response and the P1ARequest’s ballot_num is the same as the PaxosServer’s ballot_num, the timer would resend the P1ARequest to all PaxosServers and reset the timer. Else, nothing is done.
+    - P2ATimer
+        - Set by the PaxosServer (leader)
+        - **Contents:**
+            - int P2A_RETRY_MILLIS - time duration (50ms).
+            - P2ARequest p2aRequest - the P2ARequest sent by the PaxosServer (leader)
+        - Set when the leader PaxosServer wants to propose a client’s request for a log slot.
+        - When it fires, if it hasn’t receive a majority of P2B response and the timer P2ARequest’s ballot_num, slot_num, and command matches the PaxosServer information, the timer would resend the P2ARequest to all PaxosServers and reset the timer. Else, nothing is done.
+    - HeartBeatTimer
+        - Set by the PaxosServer (leader)
+        - **Contents:** int HEARTBEAT_MILLIS - timer duration (25ms)
+        - Set when the PaxosServer is the leader
+        - When it fires, if the PaxosServer is still the leader (Active == True), send the HeartBeartRequest to all other PaxosServer (follower) and reset the timer. Else, nothing is done.
+    - CheckHearBeatTimer
+        - Set by the PaxosServer (follower)
+        - **Contents:**
+            - int HEARTBEAT_CHECK_MILLIS - timer duration (100ms)
+            - Ballot ballot_num - make sure the timer is keeping track the life of the current leader
+        - Set when the PaxosServer becomes the follower (after receiving the P1ARequest’s with higher ballot_num from another PaxosServer)
+        - **When it fires:**
+            - **If ballot_num matches PaxosServer’s ballot_num:**
+                - if the PaxosServer is the leader (Active == True), do nothing.
+                - if the PaxosServer is the follower (Active == False) and isLeaderAlive == True, only reset the timer.
+                - if the PaxosServer is the follower (Active == False) and isLeaderAlive == False, clear the P1BResponse, update the ballot_num by incrementing the round number by 1 and switch to the current node’s address. Then, send P1ARequest to all other PaxosServer and set the P1ATimer. Don’t reset CheckHearBeatTimer.
+            - If ballot_num doesn’t match, ignore the timer.
+
+## Correctness/Liveness Analysis
+
+- As an overview, provide a table: on one side message types, in the other possible failure cases.
+
+| Message | Delay | Reorder | Drop | Duplicate |
+| --- | --- | --- | --- | --- |
+| PaxosRequest | Client uses ClientTimer to retransmit after timeout. AMOApplication ensures exactly-once execution despite delays | AMOApplication caches the newest request sequence number and client node address so it will not execute out of order requests. | Client retries with ClientTimer. System maintains liveness as long as some messages eventually get through. | AMOApplication guarantees exactly-once semantics, duplicates won't affect correctness. |
+| PaxosReply | Client retries original request if reply is delayed, causing leader to re-execute or return cached result. | Client tracks sequence numbers to identify the correct reply regardless of order received. | Client timeout and retries request. Leader will re-execute or return the cached result when receiving a duplicate request. | Client ignores duplicate replies by checking sequence numbers. |
+| P1A | Server uses P1ATimer to retransmit when timeout. The P1A with higher ballot_num is accepted, so message delay has no effect. | Servers always accept the P1A request with higher ballot_num, so reordering does not affect safety. | Server uses P1ATimer to retransmit. System remains alive as long as majority communication exists. | Acceptors idempotently process based on ballot number. Safety unaffected. |
+| P1B | Proposer collects responses over an extended period and retries P1A after P1ATimer fires. Consensus safety is preserved through ballot numbers. | Proposer tracks responses by ballot number, reordering doesn't affect correctness. | Proposer retries P1A when P1ATimer fires and there are not enough P1B responses arrived. | Proposer uses set and server addresses to eliminate duplicates when counting the majority. And duplicates don't affect the result of log merge. |
+| P2A | Leader resends P2A after P2ATimer timeout. Followers use ballot_num to validate the request before accepting. Consensus safety is preserved through ballot numbers. | Each slot is treated independently, so reordering between slots doesn’t affect correctness. For the same slot, the server ultimately accepts the P2A with highest ballot, maintaining consistency. | P2ATimer ensures retransmission of proposals until consensus is reached or leader is preempted | Acceptors process idempotently based on ballot and slot number. |
+| P2B | If the majority of P2Bs are delayed, the leader will retry via P2ATimer. Safety preserved by ballot checking. | Leader tracks responses by slot number, set and server addresses, allowing for arbitrary ordering of responses. | Leader retries P2A for slots without sufficient P2B responses when P2ATimer fires. | Proposer uses set and server addresses to eliminate duplicates when counting the majority consensus for individual log slots. Ballot_num is also checked before accepting P2B |
+| HeartBeatRequest | Leader retries HeartBeatRequest when HeartBeatTimer fires and it’s still the leader. If another server competes for leader, merge log allows successful leader transition and previous leader steps down. | Ballot_num is used to distinguish HeartBeatRequest. Only the highest ballot_num HeartBeatRequest will be accepted and that sender would be the leader. Thus, reordering doesn’t affect | Leader retries HeartBeatRequest when HeartBeatTimer fires and it’s still the leader. If another server competes for leader, merge log allows successful leader transition and previous leader steps down. | Only 1 HeartBeat is needed to mark the leader as alive. Log update and garbage collection are idempotent. |
+| HeartBeatReply | Leader resends the HeartBeat request when the HeartBeatTimer fires and if it is still the leader | Ballot_num is used to distinguish between old and new HeartBeatReply. The higher the ballot_num, the more up-to-date the HeartBeatReply. Because paxos always accept message with higher ballot_num, reordering doesn’t affect | Leader resends the HeartBeat request when the HeartBeatTimer fires and if it is still the leader | The process for the leader to update its state is idempotent. The garbage collection process is also idempotent. The map also uses server address as key to ensure that the leader counts the responded followers correctly even with duplicates. |
+
+- Why is the protocol correct/live even if the network delays or drops a group of messages?
+    - Paxos guarantees safety (values preserved for the same slot) regardless of message timing. Each phase requires responses from only a majority of servers, allowing progress even with some message loss. Timers ensure retransmission of critical messages. The protocol preserves consistency through ballot numbers that establish a total ordering of proposals. As long as a majority of servers can eventually communicate, the system will make progress. Even during extended network issues, the stable leader mechanism reduces unnecessary leadership changes, improving efficiency once connectivity is restored.
+- For each node, why is the protocol correct/live even if that node crashes or disappears (doesn't send or receive messages) for a long time and then later is reconnected?
+    - If a leader crashes, followers detect missing heartbeats by CheckHeartBeatTimer and initiate leader election with higher ballot numbers. Safety is preserved because any newly elected leader must learn about previously accepted values from a majority, which includes any chosen values. When the old leader reconnects, it will receive messages with higher ballot numbers and revert to the follower state. The system maintains liveness by electing a new leader among the remaining servers.
+    - If a follower crashes, the system continues to function as long as a majority remains operational. The leader can still achieve consensus with the remaining servers. When the crashed (partitioned) follower rejoins, it receives HeartBeatRequests from the current leader containing chosen commands it missed. Then, it updates its log accordingly and executes commands in sequence, eventually catching up to the current state. Garbage collection proceeds based on the slowest server, but it also works.
+    - If a client crashes while waiting for a response, no consistency issues arise. When reconnected, it can send the same request with an updated sequence number. Also, AMO semantics prevent double execution.
+- Why is the protocol correct/live even when a group of nodes are partitioned from some but not all nodes, and then the partition is resolved.
+    - It’s correct because only the partition containing a majority of servers can make progress, preventing conflicting decisions, which ensures that at most one partition can achieve consensus, eliminating "split-brain". When a partition occurs, servers in minority partitions cannot elect leaders (insufficient P1B responses) or reach consensus (insufficient P2B responses), effectively pausing operations in those segments. When partitions are resolved, the stable leader's heartbeat mechanism quickly re-establishes system-wide consensus: servers from minority partitions learn the current leader's higher ballot number, update their logs with missed decisions via heartbeats, execute commands in order to catch up, and resume normal participation. This self-healing property requires no explicit reconciliation process because the ballot number mechanism and log merging naturally converge all servers to a consistent state while preserving all decisions made during the partition.
+
+## Conclusion
+
+- **Goals achieved:**
+    - In Paxos, when a majority of the servers are alive, the leader can assign each client request to a specific log index on all replicas after it reaches consensus. This ensures every replica applies commands in the exact same order, maintaining deterministic state transitions.
+    - Paxos uses majority for agreement, so only one value can be chosen per log index. This guarantees no two replicas can decide conflicting values, preserving consistency.
+    - The system can tolerate leader or non-leader server failure. When a leader fails, a new leader can be elected through phase 1 proposal, and log merge guarantees consistency in application state and log slot command. Non-leader server failure won’t affect behavior unless active servers count drop below the majority.
+    - With Once and Exactly Once semantics implemented in the application state in lab 1, unique ID for each requests, and timers that resend client requests, P1A, P2A, and HeartBeat, messages can be delivered even if networks drop, delay, duplicate, or reorder message.
+    - Leader gets a global view of all replicas using HeartBeatRequest and HeartBeatResponse. Once it knows that an operation has been executed by all replicas, it can signal the replicas to clear the corresponding log slot, ensuring correct garbage collection behavior.
+- **Limitations:**
+    - The system contains a fixed number of servers. If the number of crashed servers exceeds the majority, the system cannot make any progress.
+    - If communication and leader election are too slow, the system can be stuck at the leader election phase and never make progress.
+    - Garbage collection only works when all servers are alive. When one server fails, the system cannot do any more garbage collection, leading to potential log overflow.
+    - High latency and message overhead as Paxos requires multiple rounds of communication to reach consensus.

@@ -1,0 +1,289 @@
+# Design: Primary-Backup Replication with a View Service
+
+*Authors: Hinyeung Lam*
+
+## Preface
+
+- **Goals:**
+    - Make a fault-tolerant service using a form of primary-backup replication with the assistance of view service that decides which machines are alive.
+    - When either the primary or the backup is dead, the ViewServer should select an idle server to become the new backup. This ensures that there are always two duplicates of the application state and the system is able to recover its state when one of the servers goes down.
+    - The primary should transfer its state to the backup when a new backup is promoted by the ViewServer.
+    - Both primary and backup needs to work together to ensure that client requests are executed Once and Only Once, and the requests are executed in the correct order regardless of message reorder, drop, delay, or duplicates by the network.
+- **Desired fault model:**
+    - The system is able to handle single server failure automatically. If the primary server fails, the backup is able to recover the application state by becoming the new primary and transfer its state to the new backup. If instead the backup server fails, the primary will transfer its state to the new backup. By maintaining two copies of the application state, the system is able to handle single server failure.
+    - By incorporating the Once and Only Once semantics implemented in Lab 1, the system can handle network failures automatically. It ensures the system runs correctly when the networks drop, duplicate, delay or reorder messages.
+- **Challenges:**
+    - Client needs to have the correct view of the primary-backup service in order to talk to the right primary.
+    - Primary and backup needs to maintain the same application state.
+    - Primary in view i+1 must have been backup or primary in view i.
+    - Primary must wait for backup to accept/execute each operation before doing operation and replying to the client.
+    - Backup must accept forwarded requests only if the view is correct.
+    - Non-primary must reject client requests.
+    - ViewServer cannot move on to view i+1 until acknowledgement from primary in view i is received.
+    - State transfer is an atomic operation. Every operation must be before or after state transfer.
+- **Assumptions:**
+    - ViewServer never crashes or halts.
+    - The primary and backup must process operations one at a time.
+    - The primary and backup won’t fail simultaneously.
+    - The primary won’t fail before acknowledging the view to the ViewServer.
+    - The backup won’t crash or fail during state transfer.
+    - Networks can drop, delay, reorder, or duplicate messages, but some messages can be delivered between nodes to ensure minimal communication.
+    - Servers fail by crashing, they fail permanently but not restart.
+
+## Protocol
+
+- **Kinds of node:**
+    - ViewServer
+        - No temporary roles, always acts as the central manager
+    - PBServer
+        - Can play the role of primary server, backup server, or idle server
+        - Role determined by the ViewServer and communicated through views
+        - Primary handles client requests and forwards operations/state to backup
+        - Backup receives state and operations from primary and confirms receipt
+        - Idle servers ping the ViewServer, waiting to be assigned as backup (maybe Primary during initialization)
+    - PBClient
+        - Always acts as a client, get information about the current view of the primary-backup system from the ViewServer, and then sends operations to the current primary
+- **State at each kind of node:**
+    - ViewServer
+        - View currentView
+            - Represents the current view - viewNum, primary, and backup
+            - Initialized with STARTUP_VIEWNUM, null primary, null backup
+            - viewNum monotonically increases with each view change
+        - List\<Address\> idleAddr
+            - Reset and track idle servers that can become backups at each Ping Check Interval.
+            - Initialized as an empty list.
+        - boolean isAck
+            - Indicates whether the current view is acknowledged by the current primary.
+            - Initialized to false.
+            - Set to true when the primary sends a Ping with the current view number.
+        - boolean isPrimaryAlive
+            - Indicates whether the current primary is alive
+            - Initialized to false
+            - Reset to false every time the PingCheckTimer fires
+            - Set to true when primary ping the ViewServer
+        - boolean isBackupAlive
+            - Indicates whether the current backup is alive
+            - Initialized to false
+            - Reset to false every time the PingCheckTimer fires
+            - Set to true when backup ping the ViewServer
+    - PBClient
+        - View view
+            - The latest view known to this server.
+            - Initialized to (STARTUP_VIEWNUM, null, null)
+            - Updated when server sends request GetView to the ViewServer and receives ViewReply with higher viewNum
+        - Address viewServerAddress
+            - Address of the ViewServer
+            - Fixed at initialization
+        - int seqNum
+            - Sequence number for client operations
+            - Initialized to 0
+            - Monotonically increasing
+        - AMOCommand pendingCommand
+            - The command currently waiting for a response
+            - Initialized to null
+            - Set when sendCommand is called to send client request
+        - AMOResult pendingResult
+            - The result of the pending command, if received
+            - Initialized to null
+            - Set when a valid reply is received from the primary
+    - PBServer
+        - View View
+            - The latest view known to this server
+            - Initialized to null
+            - Updated when server receives ViewReply with higher viewNum
+        - Address viewServerAddress
+            - Address of the ViewServer
+            - Fixed at initialization
+        - AMOApplication app
+            - The application state for key-value storage
+            - Initialized as new instance
+            - Modified by operations if server is primary or backup
+        - boolean isStateTransferring
+            - Whether the server is state transferring
+            - Initialized to false
+            - Primary sets it to true when it receives a new view saying that it has been promoted from backup to primary, and then sends stateTransferRequest to backup and sets it back to false once it receives the correct stateTransferReply.
+            - Backup sets it to true when it receives a new view saying that it has been promoted from idle to backup. After receiving stateTransferRequest, the backup sets it to false once it finishes copying the application state, and then sends stateTransferReply to primary.
+        - **AMOCommand pendingCommand:**
+            - For backup: forward command/stateTransfer sent from primary
+            - For primary: forward command/stateTransfer waiting for backup to execute
+            - Initialized to null
+- **Messages:**
+    - **Ping:**
+        - **Source:** PBServer
+        - **Destination:** ViewServer
+        - **Contents:** int viewNum - the current view number for the server
+        - When is it sent?
+            - Sent periodically by server in response to PingTimer unless the current server isStateTransferring is marked true
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - If no primary, the first server that pings become the primary and isPrimaryAlive is marked true
+            - If Primary pings, mark isPrimaryAlive true
+            - If Backup pings, mark isBackupAlive true
+            - If idle server, add it to idleAddr
+            - If the ping number from the primary matches the ViewServer current view number, mark isAck true. ViewServer is allowed to go to the next view after the primary’s acknowledgement
+            - Responds with ViewReply containing current view
+    - **GetView:**
+        - **Source:** PBClient
+        - **Destination:** ViewServer
+        - **Contents:** None
+        - When is it sent?
+            - Can be sent spontaneously by client when first time sending each individual requests
+            - Otherwise sent in response to ClientTimer when the primary didn’t reply before the timer triggered
+        - What happens at the destination when it is received?
+            - ViewServer responds with ViewReply containing current view
+    - ViewReply
+        - **Source:** ViewServer
+        - **Destination:** PBClient or PBServer
+        - **Contents:** View view - current view with viewNum, primary, backup
+        - When is it sent?
+            - Only sent in response to Ping or GetView messages
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - Client/Server updates its view if the viewReply’s viewNum is greater than the viewNum currently held by the client and server.
+            - If client: resend the request to the new view’s primary if primary is not null
+            - If server: checks if its role has changed and adjusts behavior
+                - If becoming primary and has backup: mark isStateTransferring to be true, and transfer its state to the new backup by sending stateTransferRequest, and wait for backup reply
+                - If becoming primary but no backup: do nothing and continue handle client requests
+                - If becoming backup: mark isStateTransferring to be true and waits for state transfer from primary
+                - If no longer primary/backup: stops accepting/forwarding requests, mark isStateTransferring to be false and become idle
+    - Request
+        - **Source:** PBClient
+        - **Destination:** PBServer
+        - **Contents:** AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+        - When is it sent?
+            - Can be sent spontaneously by client when first time sending each individual requests if the current view’s primary isn’t null
+            - Otherwise sent request after it receives the current view of the system from the ViewServer
+        - What happens at the destination when it is received?
+            - If server isStateTransferring == false and pendingCommand == null
+                - Primary Server: record the client request and forward it to the backup. Then, wait for backup to acknowledge. If there is no backup, execute the request and reply directly to the client.
+                - Backup/idle Server: block or reject client request
+            - In any other cases, both primary and backup servers ignore the request
+    - Reply
+        - **Source:** PBServer (primary)
+        - **Destination:** PBClient
+        - **Contents:** AMOResult amoResult - execution result from the primary (includes result, sequenceNum)
+        - When is it sent?
+            - Only sent spontaneously by primary when it finishes execution of client request, or respond directly to the client if the request is outdated or executed
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - Client checks the reply’s sequenceNum matches its request’s sequenceNum. If they match, the reply is accepted and the client moves onto the next request. If they don’t match, the client ignores the reply
+    - ForwardRequest
+        - **Source:** PBServer (primary)
+        - **Destination:** PBServer (backup)
+        - **Contents:**
+            - AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+            - int viewNum - current viewNum of the sender server
+        - When is it sent?
+            - Primary sends the ForwardRequest after it receives the client request and there is a backup server and it’s not state transferring. It will resend the ForwardRequest when the ForwardRequestTimer is fired and the above conditions maintain true
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - Backup checks that it’s not doing state transfer, the sender is the current primary, and the viewNum in the ForwardRequest equals to the current viewNum of the backup, then it executes the command in the ForwardRequest and sends acknowledgement in ForwardReply to the primary
+    - ForwardReply
+        - **Source:** PBServer (backup)
+        - **Destination:** PBServer (primary)
+        - **Contents:**
+            - AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+            - int viewNum - current viewNum of the sender server
+        - When is it sent?
+            - Backup sends the ForwardReply after it executes the primary’s ForwardRequest
+        - What happens at the destination when it is received?
+            - Primary checks the ForwardReply’s amoCommand and viewNum matches its ForwardRequest’s amoCommand and viewNum . If they match, the reply is accepted and the primary executes the client request and sends the result to the client. Then, it set pendingCommand to null so it can take in new client requests. If they don’t match, the primary ignores the ForwardReply
+            - Cannot be sent spontaneously
+    - StateTransferRequest
+        - **Source:** PBServer (primary/backup)
+        - **Destination:** PBServer (idle/backup)
+        - **Contents:**
+            - AMOApplication amoApplication - application state of the primary
+            - int viewNum - current viewNum of the sender server
+        - When is it sent?
+            - For primary: when it receives a new view from the ViewServer that says it’s still the primary but the backup is changed, the primary will send the StateTransferRequest to the new backup
+            - Or when the StateTransferRequestTimer is fired
+        - What happens at the destination when it is received?
+            - The idle server who updates its view and becomes the new backup copies the AMOApplication state over and sets the isStateTransferring to be false. Then, it sends the StateTransferReply to the new primary
+            - The backup server who received the StateTransferRequest before, checks that isStateTransferring is false. It will not copy the application state, but just send the StateTransferReply to the new primary
+    - StateTransferReply
+        - **Source:** PBServer (backup/idle)
+        - **Destination:** PBServer (primary)
+        - **Contents:** int viewNum - current viewNum of the sender server
+        - When is it sent?
+            - The new backup has finished copying the application state. It will then send the StateTransferReply to the primary
+            - The backup has the application state but still receives StateTransferRequest. It will just send the StateTransferReply to the primary
+            - Cannot be sent spontaneously
+        - What happens at the destination when it is received?
+            - The primary server checks if it’s doing state transferring and if the StateTransferReply’s viewNum matches its current viewNum. If they both are true, the primary mark isStateTransferring to false and start handling client requests.
+- **Timers:**
+    - PingCheckTimer
+        - Set by ViewServer
+        - **Contents:** int PING_CHECK_MILLIS - timer duration (100ms)
+        - Set when ViewServer is initialized
+        - When it fires, the ViewServer checks whether primary and backup are still alive.
+            - If both are alive, reset idleAddr, isPrimaryAlive, isBackupAlive and then reset the timer
+            - If only primary is alive, select an idle server if available to be the backup and update the view. Then reset idleAddr, isPrimaryAlive, isBackupAlive and the timer
+            - If only the backup is alive, promote the backup to be the primary and select an idle server if available to be the backup and update the view. Then reset idleAddr, isPrimaryAlive, isBackupAlive and the timer
+    - PingTimer
+        - Set by the PBServer
+        - **Contents:** int PING_MILLIS - timer duration (25ms)
+        - Set when PBServer is initialized
+        - When it fires, the PBServer sends a Ping containing its current viewNum to the ViewServer and reset the timer
+    - ClientTimer
+        - Set by the PBClient
+        - **Contents:** int CLIENT_RETRY_MILLIS - time duration (100ms). AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+        - Set when PBClient sends request to primary
+        - When it fires, if the PBClient didn’t receive the server reply, it gets the current view from the ViewServer and then resends the request to the current primary. The timer is also reset. If the server reply is received, nothing will be done.
+    - ForwardRequestTimer
+        - Set by the primary
+        - **Contents:**
+            - int FORWARD_RETRY_MILLIS - time duration (50ms).
+            - AMOCommand amoCommand - command to be executed by the backup (includes command, sequenceNum, client address)
+            - int viewNum - current viewNum of the server
+        - Set when primary gets a client request
+        - When it fires, if the primary didn’t receive backup’s acknowledgement, the primary re-forward the ForwardRequest to the backup and reset the timer. If the backup is acknowledged, nothing will be done.
+    - StateTransferRequestTimer
+        - Set by the primary
+        - **Contents:**
+            - int STATE_RETRY_MILLIS - time duration (25ms).
+            - int viewNum - current viewNum of the server
+        - Set when the view has changed and primary needs to do a state transfer to the backup
+        - When it fires, if the primary didn’t receive backup’s acknowledgement, it resends the stateTransferRequest to the backup and reset the timer. If the backup is acknowledged, nothing will be done.
+
+## Correctness/Liveness Analysis
+
+- As an overview, provide a table: on one side message types, in the other possible failure cases.
+
+| Message | Delay | Reorder | Drop | Duplicate |
+| --- | --- | --- | --- | --- |
+| Ping | Ping delay won’t matter if the ping still falls in the same Ping Check Interval. If it falls outside of the Interval, then the ViewServer will consider the server to be dead and cause a change in view. If both primary and backup ping are delayed, or the primary view acknowledges ping is delayed, the ViewServer cannot make progress or switch to a new view and have to hope that the ping eventually comes through. | If the ping still falls within the same Ping Check Interval, it won’t matter. If the ping falls out of the Ping Check Interval, the ViewServer will mark the server as dead, move to a new view, select an idle server as backup, and cause state transfer to maintain the active primary-backup pairing. | ViewServer will consider the server to be dead and cause a change in view. If both primary and backup ping are dropped, or the primary view acknowledges ping is dropped, the ViewServer cannot make progress or switch to a new view and have to hope that the ping eventually comes through. | It will not affect the system since the ViewServer only needs 1 ping to mark the server as alive during each Ping Check Interval. Any duplicate ping within the interval doesn’t matter. |
+| GetView | No effect if the current view of the client matches the view of the ViewServer. If their views don’t match, client requests will not be received by the primary and thus no response to the client. The ClientTimer will then fire and resend another GetView to the ViewServer asking for the updated view until the ViewServer replies with the new view. | GetView doesn’t have any content, so all GetView messages are the same. Reordering of the GetView message doesn’t have any effect on the system. | No effect if the current view of the client matches the view of the ViewServer. If their views don’t match, client requests will not be received by the primary and thus no response to the client. The ClientTimer will then fire and resend another GetView to the ViewServer asking for the updated view until the ViewServer replies with the new view. | GetView doesn’t have any content, so all GetView messages are the same. Duplicate GetView will just cause more ViewReply from the ViewServer. |
+| ViewReply | No effect if the current view of the client and server matches the view of the ViewServer. If their views don’t match, client, primary, and backup cannot communicate to each other. The ClientTimer will then fire and resend another GetView to the ViewServer asking for the updated view. The server PingTimer will also fire consistently to ask for the current view of the ViewServer. | Since viewNum increases monotonically, reordering ViewReply will only cause client, primary, and backup to receive ViewReply with a smaller viewNum than the current view’s viewNum. Views with lower viewNum will be ignored by the client and server. | No effect if the current view of the client and server matches the view of the ViewServer. If their views don’t match, client, primary, and backup cannot communicate to each other. The ClientTimer will then fire and resend another GetView to the ViewServer asking for the updated view. The server PingTimer will also fire consistently to ask for the current view of the ViewServer. | It will not affect the system since the client, primary and backup only needs 1 ViewReply to get to know the current view. Duplicate ViewReply can only confirm that the current view is correct and has no other effect. |
+| Request | Client has a ClientTimer for each request. When the request is delayed, the client won’t receive a server response before the timer fires, so the client will retransmit the same request, making sure that the request eventually gets received by the server. The client won’t move on until the current request is processed. | The AMOapplication caches the newest request sequence number and client node address so it will not execute old requests, and the lab setting (one outstanding request per client) prevents future requests from being delivered until previous requests are finished. | Client has a ClientTimer for each request. When the request is dropped, the client won’t receive a server response before the timer fires, so the client will retransmit the same request, making sure that the request eventually gets received by the server. | Since we implemented the At Most Once semantics in the AMOApplication, duplicate requests won’t be executed by the server and a copy of previous result will be returned instead. |
+| Reply | Client has a ClientTimer for each request. When the reply is delayed, the client won’t receive a server response before the timer fires, so the client will retransmit the same request, making the server replies again until the client receives the reply. | The client has the current request’s sequence number, so any reply with an incorrect sequence number will be ignored. The client will wait until the reply with the matching sequence number is received. | Client has a ClientTimer for each request. When the reply is dropped, the client won’t receive a server response before the timer fires, so the client will retransmit the same request, making the server replies again until the client receives the reply. | Since the client only sends one outstanding request at a time, any duplicate replies received by the client will have a smaller sequence number than the client’s current request sequence number. So, the client will ignore duplicate replies. |
+| ForwardRequest | Primary has a ForwardRequestTimer for the current forward request. When the request is delayed, the primary won’t receive a backup response before the timer fires, so the primary will re-forward the same request, making sure that the request eventually gets received by the backup. | The AMOapplication caches the newest request sequence number and client node address so it will not execute old requests, and the lab setting (one outstanding request per client) prevents future requests from being delivered until previous requests are finished. So, when ForwardRequest is reordered, it can only be an old request, which has no effect given that we have At Most Once semantics. | Primary has a ForwardRequestTimer for each forward request. When the request is dropped, the primary won’t receive a backup response before the timer fires, so the primary will re-forward the same request, making sure that the request eventually gets received by the backup. | Since we implemented the At Most Once semantics in the AMOApplication, duplicate forward requests won’t be executed by the backup and a copy of previous result will be returned instead. |
+| ForwardReply | Primary has a ForwardRequestTimer for the current forward request. When the reply is delayed, the primary won’t receive a backup response before the timer fires, so the primary will retransmit the same request, making the backup replies again until the primary receives the reply. | The primary has the current forward request’s amoCommand (sequence number, client address, and command) and viewNum, so any backup reply with an incorrect amoCommand or viewNum will be ignored. The primary will wait until the backup reply with the matching amoCommand and viewNum is received. | Primary has a ForwardRequestTimer for the current forward request. When the reply is dropped, the primary won’t receive a backup response before the timer fires, so the primary will retransmit the same request, making the backup replies again until the primary receives the reply. | Since we implemented the At Most Once semantics in the AMOApplication, duplicate replies won’t cause re-execution of the same request in the primary. Duplicate forward reply has no effect on the primary. |
+| StateTransferRequest | Primary has a StateTransferRequestTimer for the StateTransferRequest. When the request is delayed, the primary won’t receive a backup response before the timer fires, so the primary will resend the StateTransferRequest, making sure that the request eventually gets received by the backup. | Backup will check the current view and its isStateTransferring flag to make sure the sender is the current primary and the backup itself needs to conduct state transfer before accepting StateTransferRequest . | Primary has a StateTransferRequestTimer for the StateTransferRequest. When the request is dropped, the primary won’t receive a backup response before the timer fires, so the primary will resend the StateTransferRequest, making sure that the request eventually gets received by the backup. | Once the backup finishes copying over the application state, it will mark the isStateTransferring flag to be false. So any duplicate StateTransferRequest will be ignored as the backup will not perform state transfer if the isStateTransferring is false. |
+| StateTransferReply | Primary has a StateTransferRequestTimer for the current stateTransferrequest. When the reply is delayed, the primary won’t receive a backup response before the timer fires, so the primary will retransmit the same request, making the backup replies again until the primary receives the reply. | Primary will check the current view and make sure the sender is the current backup and the reply’s viewNum matches the primary viewNum before accepting StateTransferReply. | Primary has a StateTransferRequestTimer for the current stateTransferrequest. When the reply is dropped, the primary won’t receive a backup response before the timer fires, so the primary will retransmit the same request, making the backup replies again until the primary receives the reply. | Duplicate StateTransferReply doesn’t affect the primary. They would just confirm the state transfer is complete. The isStateTransferring will be marked as false when the first StateTransferReply is received. So duplicate StateTransferReply will be ignored. |
+
+- Why is the protocol correct/live even if the network delays or drops a group of messages?
+    - The protocol uses several redundancy mechanisms, such as clients retrying operations with increased timeouts, the primary servers also attempt to forward to back-up servers if not successful, all nodes refresh their views periodically from the ViewServer. The protocol maintains the exactly-once semantics through AMO Commands and sequence numbers, which ensure that an operation is not executed twice. The ViewServer informs the system of its current state at intervals through pinging. Thus, the role change occurs when a node becomes unreachable. Although a great deal of messages may be lost, eventually, the entire set will reach a consensus state when connectivity returns to the full view. This is because the primary server will synchronize its view with that of the back-up server, and each client will receive the most recent views to allow the primary server to reach correct views.
+- For each node, why is the protocol correct/live even if that node crashes or disappears (doesn't send or receive messages) for a long time and then later is reconnected?
+    - View Server: The system assumes ViewServer never fails (a limitation of design).
+    - **Server:**
+        - Primary Server: If the primary crashes, ViewServer promotes backup to primary after missing Pings. When the old primary reconnects, it will learn from the view server that it's no longer primary and will become idle or backup. System remains correct as backup updates state for every operation on primary, and has the exact same state as primary.
+        - Backup Server: If backup crashes, ViewServer removes it from view and promotes available idle server to backup. System remains correct as primary can operate without backup. When backup reconnects, it becomes idle until potentially assigned as backup again, at which point it receives full state transfer.
+        - Idle Server: If idle server crashes and reconnects, it simply resumes pinging ViewServer and may eventually be assigned as backup.
+        - Client: If a client crashes and reconnects, it can resume operations by getting the current view from View Server. AMOCommand and sequence numbers ensure exactly-once semantics.
+- Why is the protocol correct/live even when a group of nodes are partitioned from some but not all nodes, and then the partition is resolved.
+    - The View Server is an authoritative source for the server’s role. If there is a partition separating the primary from backup, then it can get through the ViewServer to delete the backup and the primary moves on without waiting on the backup acknowledgment. If you are partitioned away from the primary then the client will go into contact with the ViewServer which will send them to the right primary. Partitions rejoin when both parts have both ends connected to the other part. At this point, both parts will ping their end back to the ViewServer while the clients receive views from both sides at the same time and the mobile primary transfers the complete state over to the backup. With this convergence that means once in a while the system comes back to an equal state once the partition has healed, and still just has one working primary getting client requests, and transmitting data consistently.
+
+## Conclusion
+
+- **Goals achieved:**
+    - The ViewServer ensures that the current primary and current backup are always alive. Whenever one of them crashes, the ViewServer will promote an idle server to be the backup so there are always two copies of application state in the system.
+    - Each client can only have one outstanding request. The Primary must wait for backup to accept/execute each operation before doing operation and replying to the client. So, the backup’s state is at most 1 operation ahead of the primary’s state, making sure that no matter which of them crashes, the new pair of primary-backup is able to maintain the most up-to-date application state.
+    - The ViewServer always keeps track of a list of idle servers, making sure that the system maintains a primary-backup pair whenever possible.
+    - The primary constantly checks the current view from ViewServer. It will stop forwarding requests and start state transfer when there is a change in backup server. State transfer is an atomic operation, so primary would have to transfer its state to the new backup before it can process any incoming client requests.
+    - The Once and Only Once semantics implemented in lab1 ensures that the client requests will be executed only once in both the primary and backup. The timer allows message retransmission, making it possible for nodes to communicate when the networks can reorder, drop, delay, or duplicate messages.
+- **Limitations:**
+    - The ViewServer is a single point of failure. If the ViewServer crashes, the system cannot move onto new views. So, if a primary or backup server crashes after the ViewServer crashes, the system cannot make more progress until the ViewServer comes back.
+    - The current system doesn’t tolerate simultaneous failure from both the primary and backup server. If both of them crash at the same time, the AMOApplication state will be lost forever and the system will not be able to process client requests correctly.
+    - During state transfer, the primary and backup cannot crash. If the primary fails in the middle of state transfer, the AMOApplication state might be lost if the backup didn’t copy the state before the primary crashes. If the backup keeps failing during state transfer, then the primary cannot finish transferring state and the system is stuck. No progress can be made as no client request can be processed during state transfer.
+    - Primary must acknowledge the current view on the ViewServer before crashing. If the primary fails before acknowledging the view, the ViewServer cannot move onto a new view and the system will fail.

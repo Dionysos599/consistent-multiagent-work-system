@@ -1,0 +1,336 @@
+# Design: Sharded Key/Value Store with Live Reconfiguration
+
+*Authors: Hinyeung Lam*
+
+## Preface
+
+- **Goals:**
+    - Build a sharded fault-tolerant key/value storage system. Each ShardStoreServer will operate as part of a replica group. Each replica group will serve operations for some of the key-space shards.
+    - The system can continue to make progress as long as a majority of replicas within a group are still alive.
+- **Desired fault model:**
+    - The system is able to handle single server failure automatically as long as the amount of active servers within a group is greater than the total number of servers in the group. When the leader fails, the system is able to elect a new leader and continue with client’s requests. When a non-leader server fails, it has no effect on the system.
+    - The system can handle network failures automatically as long as messages aren’t corrupted. It ensures the system runs correctly when the networks drop, duplicate, delay or reorder messages.
+- **Challenges:**
+    - During reconfiguration, the server cannot process any additional requests. It needs to keep track of all servers that it needs to receive shards from, and all shards it needs to remove and the corresponding servers to send to. The reconfiguration is only done when both are fulfilled.
+    - The ShardStoreServer itself cannot decide and execute reconfiguration and client requests. It needs to use Paxos to communicate with other servers in the group, reach consensus and then execute.
+    - Clients should always ask for the most updated configuration, but servers should only ask for configuration that’s 1 version ahead.
+- **Assumptions:**
+    - A majority of servers are always alive, so consensus can be reached and progress can be made in the system.
+    - Only one outstanding request per client at a time.
+    - Servers fail by crashing, they fail permanently but not restart.
+    - Shardmaster and Paxos were implemented correctly.
+    - Networks can drop, delay, reorder, or duplicate messages, but some messages can be delivered between nodes to ensure minimal communication.
+
+## Protocol
+
+- **Kinds of node:**
+    - ShardStoreClient
+        - Learn about the most recent shard configuration from the ShardMaster.
+        - Send ShardStoreRequest to the Paxos group that has the key/value data to execute the request.
+        - Wait for the current ShardStoreRequest to be executed before sending the next ShardStoreRequest.
+    - ShardMaster (will not be explained in this design doc since it belongs to part 1)
+        - Constantly update shards assignment to ensure load balance between all Paxos groups.
+        - Return the configuration to the ShardStoreClient and ShardStoreServer based on their query.
+    - ShardStoreServer
+        - Work in a group using Paxos. ShardStoreServers within the same group are replicated state machines for a portion of the assigned shards.
+        - ShardStoreServer is responsible for getting the shard configuration and receives ShardStoreClient requests. These operations will go through Paxos subnode, so a consensus for the order of execution can be reached, ensuring all ShardStoreServer in the same group has the same state.
+        - Paxos subnode will process operations sent by ShardStoreServer, and upon reaching consensus, it delivers the Paxos decision back to the ShardStoreServer.
+- **State at each kind of node:**
+    - ShardStoreClient
+        - Address[] shardMasters
+            - List of shardMasters server address
+            - Fixed at initialization
+        - ShardConfig shardConfig
+            - The most recent configuration obtained from the shardMaster
+            - int configNum
+                - The configuration number
+                - Initialized to 0 (INITIAL_CONFIG_NUM)
+                - Set when the shardMaster returns the newest configuration
+            - Map\<Integer, Pair\<Set\<Address\>, Set\<Integer\>\>\> groupInfo
+                - The most recent configuration with groupId as key, and a pair of group members server addresses and shard numbers as value.
+                - Initialized to null
+                - Set when the shardMaster returns the newest configuration
+        - int seqNum
+            - Sequence number for client operations
+            - Initialized to 0
+            - Monotonically increasing
+        - AMOCommand pendingCommand
+            - The command currently waiting for a response
+            - Initialized to null
+            - Set when sendCommand is called to send client request
+        - AMOResult pendingResult
+            - The result of the pending command, if received
+            - Initialized to null
+            - Set when a valid reply is received from the primary
+    - ShardMaster
+        - int numShards
+            - Total number of shards in the system
+            - Fixed at initialization
+        - Map\<Integer, ShardConfig\> configs
+            - Map that stores the history of all configurations, with configNum as key and the corresponding configuration version as value.
+            - Initialized to empty map
+        - int currentConfigNum
+            - The most current configuration’s number
+            - Initialized to -1
+    - ShardStoreServer
+        - Address[] group
+            - List of server address in the Paxos group
+            - Fixed at initialization
+        - int groupId
+            - The groupId of this Paxos group
+            - Fixed at initialization
+        - boolean isReconfiguring
+            - Whether the server is doing reconfiguration
+            - Initialized to false
+            - Set to true when the Paxos subnode decides to update configuration to the newly received reconfiguration that requires the server to move shards to other Paxos groups or accept shards from other Paxos groups.
+            - Set back to false when the server receives all necessary shards, and ShardMoveAck from other Paxos groups.
+        - Map\<Integer, AMOApplication\> shardToApp
+            - Map that stores the AMOApplication for each shard. Each shard has its own AMOApplication so it’s easier to move shards between different Paxos groups.
+        - ShardConfig shardConfig
+            - The most recent configuration obtained from the shardMaster
+            - int configNum
+                - The configuration number
+                - Initialized to 0 (INITIAL_CONFIG_NUM)
+                - Set when the shardMaster returns the newest configuration
+            - Map\<Integer, Pair\<Set\<Address\>, Set\<Integer\>\>\> groupInfo
+                - The most recent configuration with groupId as key, and a pair of group members server addresses and shard numbers as value.
+                - Initialized to null
+                - Set when the shardMaster returns the newest configuration
+        - Map\<Integer, Set\<Integer\>\> shardToSend
+            - The map that records the other Paxos groups that this group needs to send the set of shards numbers to. GroupId as key and the corresponding shards number that needs to be sent as value. These shards and applications also need to be removed from this group.
+            - Initialized to null
+            - Set when the ShardStoreServer needs to do reconfiguration
+        - Set\<Integer\> shardToReceive
+            - The set of shards numbers that needs to be received from other Paxos groups and added to this Paxos group.
+            - Initialized to null
+            - Set when the ShardStoreServer needs to do reconfiguration
+- **Messages:**
+    - ShardStoreRequest
+        - **Source:** ShardStoreClient
+        - **Destination:** ShardStoreServer
+        - **Contents:**
+            - AMOCommand amoCommand - command to be executed by the Server (includes command, sequenceNum, client address)
+            - int configNum - the configuration number of client
+        - When is it sent?
+            - Can be sent spontaneously when a client calls sendCommand() and the shardConfig.configNum != 0. In this case, client increments seqNum, stores pendingCommand, broadcast, and sets ClientTimer.
+            - Otherwise resend request after it receives the current configuration of the system from the shardMaster
+        - What happens at the destination when it is received?
+            - The server checks if it’s not reconfiguring, if the configNum matches and if the command is a singleKeyCommand:
+                - If not, return ShardStoreReply with hasError == True
+                - If yes, check if the servers have the shards needed for this operation using keyToShard():
+                    - If not, return ShardStoreReply with hasError == True
+                    - If yes, use shardToApp to find the application for the shard, and check if it has been executed:
+                        - If not, send to Paxos subnode and wait for Paxos decision
+                        - If yes, return the result directly in ShardStoreReply
+    - ShardStoreReply
+        - **Source:** ShardStoreServer
+        - **Destination:** ShardStoreClient
+        - **Contents:**
+            - AMOResult result - either a successful KVStore result, or null
+            - int configNum - the current configuration number of server
+            - boolean hasError - true if wrong group or system is reconfiguring
+        - When is it sent?
+            - Only in response, and never sent spontaneously. Sent when there is an error in the ShardStoreRequest or sent after Paxos decides and the ShardStoreServer executes the command.
+        - What happens at the destination when it is received?
+            - If hasError == True: send a query (-1) to the shardMaster for the most updated configuration, and then resend the request.
+            - **Else, check If sequenceNum matches pending command:**
+                - If match: store result and notify waiting thread
+                - If not match: ignore
+    - PaxosRequest (Query)
+        - **Source:** ShardStoreServer or ShardStoreClient
+        - **Destination:** ClientShardMaster
+        - **Contents:**
+            - int configNum - the configuration number to query (-1 means latest, positive number means specific historical config)
+        - When is it sent?
+            - **By ShardStoreServer:**
+                - Sent in initialization.
+                - Sent spontaneously when QueryTimer fires to check if there's a newer configuration available
+            - **By ShardStoreClient:**
+                - Sent in initialization.
+                - Sent in response to receiving ShardStoreReply with hasError = true.
+                - Sent when ClientTimer fires, indicating a potential outdated configuration in the client.
+        - What happens at the destination when it is received?
+            - ShardMaster returns the requested ShardConfig
+                - If the configNum is -1 or larger than the largest known configuration number, the ShardMaster should reply with the latest configuration.
+                - Else, return the corresponding configuration in history.
+    - PaxosReply (Query)
+        - **Source:** ShardMaster
+        - **Destination:** ShardStoreServer or ShardStoreClient
+        - **Contents:**
+            - ShardConfig config - the configuration containing configNum and groupInfo
+        - When is it sent?
+            - Only in response to a query, and never sent spontaneously.
+        - What happens at the destination when it is received?
+            - ShardStoreClient: Updates config cache if configNum is larger
+            - ShardStoreServer: If configNum is larger than current and isReconfiguring == false, proposes StartReconfiguration to Paxos
+    - ShardMove
+        - **Source:** ShardStoreServer (old owner of shard)
+        - **Destination:** ShardStoreServer (new owner)
+        - **Contents:**
+            - int groupId - the group ID of the destination server group
+            - int configNum - the configuration number this move is for
+            - Map\<Integer, AmoApplication\> shardToApp - shards and AMOApplication needs to be moved
+        - When is it sent?
+            - Can be sent Spontaneously after Paxos decides StartReconfiguration and this server needs to send shards. In this case, it is broadcast in the destination group, and the ShardMoveTimer will be set.
+            - In response when ShardMoveTimer fires without receiving ack
+        - What happens at the destination when it is received?
+            - **The server checks if the configNum matches and if isReconfiguring == True:**
+                - **If both conditions are meet:**
+                    - Send to Paxos subnode and wait for Paxos decision
+                - If isReconfiguring == False and configNum is smaller or equal to the current configNum
+                    - Send ShardMoveAck back to the sender
+    - ShardMoveAck
+        - **Source:** ShardStoreServer (new owner)
+        - **Destination:** ShardStoreServer (old owner)
+        - **Contents:**
+            - int configNum - the configuration number this ack is for
+            - int groupId - the group ID of the sender server group
+        - When is it sent?
+            - Only in response after Paxos decided and ShardStoreServer executed the ShardMove command. Never sent spontaneously. Broadcasts to all servers in the old owner’s group.
+        - What happens at the destination when it is received?
+            - If the configNum matches, the server isReconfiguring == True, and groupId is in the key of shardToSend:
+                - Send to Paxos subnode and wait for Paxos decision
+            - Else, ignore
+- [Internal operation proposed to local Paxos subnode through handleMessage and Paxos decision on the proposed operation]
+    - PaxosRequest (for ShardStoreRequest)
+        - **Source:** ShardStoreServer
+        - **Destination:** Paxos subnode
+        - **Contents:**
+            - AMOCommand command - command to be executed by the Server (includes command, sequenceNum, client address)
+        - When is it sent?
+            - Sent when server receives a valid ShardStoreRequest and wants to put it into the log to replicate it
+        - What happens at the destination when it is received?
+            - If the Paxos subnode is the leader, it will proposed the command into a log slot and broadcast to all other Paxos subnodes in the group
+            - When it receives a majority vote and reaches consensus, it sends a PaxosDecision message to the ShardStoreServer, so the server can execute the command in application.
+    - PaxosDecision (for ShardStoreRequest)
+        - **Source:** Paxos subnode
+        - **Destination:** ShardStoreServer
+        - **Contents:**
+            - AMOCommand command - command to be executed by the Server (includes command, sequenceNum, client address)
+        - When is it sent?
+            - Sent when the log slot for this command is marked as chosen by the leader of the Paxos group.
+        - What happens at the destination when it is received?
+            - ShardStoreServer executes the command in the AMOapplication corresponds to the shards. Then, send the result of the execution back to the ShardStoreClient using the ShardStoreRepy message with error set to false.
+    - PaxosRequest (for NewConfig)
+        - **Source:** ShardStoreServer
+        - **Destination:** Paxos subnode
+        - **Contents:**
+            - ShardConfig config - the configuration containing configNum and groupInfo
+        - When is it sent?
+            - Sent when server receives a updated NewConfig with a change in configuration and wants to put it into the log to replicate it
+        - What happens at the destination when it is received?
+            - If the Paxos subnode is the leader, it will proposed the command into a log slot and broadcast to all other Paxos subnodes in the group
+            - When it receives a majority vote and reaches consensus, it sends a PaxosDecision message to the ShardStoreServer, so the server can execute the command in application.
+    - PaxosDecision (for NewConfig)
+        - **Source:** Paxos subnode
+        - **Destination:** ShardStoreServer
+        - **Contents:**
+            - ShardConfig config - the configuration containing configNum and groupInfo
+        - When is it sent?
+            - Sent when the log slot for this command is marked as chosen by the leader of the Paxos group.
+        - What happens at the destination when it is received?
+            - Set isReconfiguring to true
+            - Set up shardToSend and shardToReceive by using the outdated local shardConfig and updated config in the message
+            - Update local shardConfig to the config in the message
+            - Check if both shardToReceive and shardToSend are empty, if they are empty, set isReconfiguring to false to finish reconfiguration (some group may have the same shards in the updated reconfiguration)
+    - PaxosRequest (for ShardMove)
+        - **Source:** ShardStoreServer
+        - **Destination:** Paxos subnode
+        - **Contents:**
+            - int groupId - the group ID of the destination server group
+            - int configNum - the configuration number this move is for
+            - Map\<Integer, AmoApplication\> shardToApp - shards and AMOApplication needs to be moved
+        - When is it sent?
+            - Sent when server receives a valid ShardMove message and wants to put it into the log to replicate it
+        - What happens at the destination when it is received?
+            - If the Paxos subnode is the leader, it will proposed the command into a log slot and broadcast to all other Paxos subnodes in the group
+            - When it receives a majority vote and reaches consensus, it sends a PaxosDecision message to the ShardStoreServer, so the server can execute the command in application.
+    - PaxosDecision (for ShardMove)
+        - **Source:** Paxos subnode
+        - **Destination:** ShardStoreServer
+        - **Contents:**
+            - int groupId - the group ID of the destination server group
+            - int configNum - the configuration number this move is for
+            - Map\<Integer, AmoApplication\> shardToApp - shards and AMOApplication needs to be moved
+        - When is it sent?
+            - Sent when the log slot for this command is marked as chosen by the leader of the Paxos group.
+        - What happens at the destination when it is received?
+            - Server updates its shardToApp to contain the new shards and applications
+            - Update shardToReceive by removing the received shards
+            - Check if both shardToReceive and shardToSend are empty, if they are empty, set isReconfiguring to false to finish reconfiguration
+            - Server sends a ShardMoveAck message to the sender of ShardMove
+    - PaxosRequest (for ShardMoveAck)
+        - **Source:** ShardStoreServer
+        - **Destination:** Paxos subnode
+        - **Contents:**
+            - int configNum - the configuration number this ack is for
+            - int groupId - the group ID of the sender server group
+        - When is it sent?
+            - Sent when server receives a valid ShardMoveAck message and wants to put it into the log to replicate it
+        - What happens at the destination when it is received?
+            - If the Paxos subnode is the leader, it will proposed the command into a log slot and broadcast to all other Paxos subnodes in the group
+            - When it receives a majority vote and reaches consensus, it sends a PaxosDecision message to the ShardStoreServer, so the server can execute the command in application.
+    - PaxosDecision (for ShardMoveAck)
+        - **Source:** Paxos subnode
+        - **Destination:** ShardStoreServer
+        - **Contents:**
+            - int configNum - the configuration number this ack is for
+            - int groupId - the group ID of the sender server group
+        - When is it sent?
+            - Sent when the log slot for this command is marked as chosen by the leader of the Paxos group.
+        - What happens at the destination when it is received?
+            - Remove the shards application in shardToApp that was sent in the corresponding ShardMove
+            - Update shardToSend by removing the map entry with key groupId
+            - Check if both shardToReceive and shardToSend are empty, if they are empty, set isReconfiguring to false to finish reconfiguration
+- **Timers:**
+    - ClientTimer
+        - Set by the ShardStoreClient
+        - Contents:int CLIENT_RETRY_MILLIS - time duration (100ms). ShardStoreRequest shardStoreRequest - command to be executed by the Server
+        - Set when ShardStoreClient sends a request to the ShardStoreServer Group that holds the key/value.
+        - When it fires, if the ShardStoreClient didn’t receive the server reply and the current client’s request matches the command in the timer, the ShardStoreClient send a query to the shardMaster for the most recent configuration, and then resends the request to all ShardStoreServers in the Paxos group and reset the timer. Else, nothing is done
+    - QueryTimer
+        - Set by the ShardStoreServer
+        - Contents:int QUERY_RETRY_MILLIS - time duration (50ms).
+        - Set in initialization. The timer is reset every time it fires.
+        - When it fires, the ShardStoreServer will broadcast a query with current configNum + 1 to the shardMaster.
+    - ShardMoveTimer
+        - Set by the ShardStoreServer
+        - Contents:int MOVE_RETRY_MILLIS - time duration (50ms). int configNum -the configuration that causes the ShardMove
+        - Set when the ShardStoreServer is doing reconfiguration and the ShardMove request is sent to the corresponding Paxos group.
+        - When it fires, the ShardStoreServer checks whether the timer configNum matches the current configNum and if the server is still in reconfiguration (isReconfiguring == True)
+            - If all of them are true: iterate through shardToSend and send out ShardMOVE requests to all corresponding servers. Then, reset the timer.
+            - Else, do nothing and drop the timer.
+
+## Correctness/Liveness Analysis
+
+- As an overview, provide a table: on one side message types, in the other possible failure cases.
+
+| Message | Delay | Reorder | Drop | Duplicate |
+| --- | --- | --- | --- | --- |
+| ShardStoreRequest | Client retry ensures eventual delivery. During reconfig, all requests are immediately rejected, forcing clients to query for updated config and retry. | AMO handles out-of-order with seqNum | Client timer retries until success. Requests rejected during reconfig force config refresh and retry. | AMO prevents duplicate execution |
+| ShardStoreReply | Client retry on timeout, causing server to re-execute or return cached result. | Client checks seqNum matching, ignores old server reply | Client timer causes re-request | Client ignores duplicate replies |
+| Query | Periodic retry handles delay. ShardMaster stores historical configuration. Old query will simply return old configs. | Config numbers ensure order | QueryTimer ensures retry. Servers query for configNum+1 (next version), clients query for -1 (latest config). | Read-only, idempotent |
+| NewConfig | Periodic query retry handles delay. Server check configNum to ensure only update when the received configNum is larger | Server check configNum to ensure only update when the received configNum is larger | Server will resend query with the same configNum to the shardMaster | Same config returned has no effect in the system. |
+| ShardMove | Timer ensures delivery. The server will only process ShardMove with matching configNum. All ShardMove must reach Paxos consensus within the receiving group before taking effect, ensuring atomic state changes across replicas. | Server check configNum to ensure only accept when the received configNum is the same. All ShardMove must reach Paxos consensus within the receiving group before taking effect, ensuring atomic state changes across replicas. | Server retries ShardMove on ShardMoveTimer firing. All ShardMove must reach Paxos consensus within the receiving group before taking effect, ensuring atomic state changes across replicas. | Idempotent, configNum ensures that the moved over shards application is correct. And copying the same application state multiple time has no effect. All ShardMove must reach Paxos consensus within the receiving group before taking effect, ensuring atomic state changes across replicas. |
+| ShardMoveAck | Sender timer retries ShardMove. The server will only process ShardMoveAck with matching configNum. All ShardMoveAck processing requires Paxos consensus within the sending group before removing shards, ensuring atomic cleanup across replicas. | Server check configNum to ensure only accept when the received configNum is the same. All ShardMoveAck processing requires Paxos consensus within the sending group before removing shards, ensuring atomic cleanup across replicas. | Sender retries ShardMove when ShardMoveTimer times out. All ShardMoveAck processing requires Paxos consensus within the sending group before removing shards, ensuring atomic cleanup across replicas. | configNum ensures correctness. Idempotent operation to remove application and shardToSend. All ShardMoveAck processing requires Paxos consensus within the sending group before removing shards, ensuring atomic cleanup across replicas. |
+| Internal message not sent over the network | N/A | N/A | N/A | N/A |
+
+- Why is the protocol correct/live even if the network delays or drops a group of messages?
+    - Client retries with timers ensure requests eventually reach available servers, periodic QueryTimers allow servers to eventually learn about configuration changes even if previous queries were lost, ShardMoveTimers guarantee shard transfers eventually complete when network connectivity is restored, and the AMO application prevents duplicate execution when delayed messages eventually arrive. Most critically, during reconfiguration, all client requests are immediately rejected, forcing clients to refresh their configuration and retry with the correct server group. The system continues operating with its current configuration even when all Query messages are dropped (servers keep serving their current shards), and during reconfiguration, the old owner continues serving a shard until the transfer is explicitly acknowledged through Paxos consensus, preventing any period where no group owns a shard. The combination of idempotent operations, explicit acknowledgments, Paxos consensus for all state changes, and timer-based retries ensures that once network connectivity is restored, all delayed operations complete correctly without violating linearizability.
+- For each node, why is the protocol correct/live even if that node crashes or disappears (doesn't send or receive messages) for a long time and then later is reconnected?
+    - ShardStoreClient: If a client crashes and later reconnects, correctness is maintained because it will use a new sequence number space, and any old pending operations are simply abandoned. The client can query ShardMaster for the current configuration and resume sending new operations without affecting system correctness.
+    - ShardStoreServer: By assumptions, servers don't recover after crashing (no persistence), so this case doesn't apply. However, if a server becomes temporarily unreachable due to network issues and reconnects, it would rejoin its Paxos group, catch up on missed decisions through Paxos's log, learn about configuration changes through QueryTimer, and resume normal operation with the correct state.
+    - ShardMaster: If a minority of ShardMaster servers crash or become unreachable, the remaining majority continues operating normally. Since the lab assumes no recovery after crashes, crashed ShardMaster nodes don't reconnect, but the system remains available as long as a majority survives.
+- Why is the protocol correct/live even when a group of nodes are partitioned from some but not all nodes, and then the partition is resolved.
+    - Each component has independent failure handling: Paxos within each replica group ensures that only the majority partition can make progress, preventing split-brain scenarios where both partitions might serve the same shard; the ShardMaster continues operating as long as a majority of its servers can communicate, ensuring configuration management remains available; and the shard transfer protocol requires explicit acknowledgment through Paxos consensus before the old owner stops serving, ensuring that if groups are partitioned during reconfiguration, the old owner continues serving until communication is restored and the transfer completes. All reconfiguration operations (StartReconfiguration, ProcessShardMove, ProcessShardMoveAck) must reach Paxos consensus within each group, ensuring atomic state transitions across replicas. When partitions heal, QueryTimers ensure servers learn about any configuration changes they missed, ShardMoveTimers retry any incomplete shard transfers, and clients automatically retry failed operations, eventually finding the correct server group - all while maintaining linearizability because at most one group ever serves each shard at any point in time.
+
+## Conclusion
+
+- **Goals achieved:**
+    - Implemented a fault tolerant, linearizable sharded key/value store with load balance. With Paxos implementation for each replicated state machine to ensure availability even when a minority of servers crash.
+    - With Once and Exactly Once semantics implemented in the application state in lab 1, unique ID for each request, and messages retransmission after timer time out, messages can be delivered even if networks drop, delay, duplicate, or reorder messages.
+- **Limitations:**
+    - If the number of crashed servers exceeds the majority, the system cannot make progress.
+    - Lacks persistent storage for key/value pairs and for the Paxos log
+    - Evolve the sets of peers in each Paxos group
+    - Handoff of shards is slow and doesn't allow concurrent client access
