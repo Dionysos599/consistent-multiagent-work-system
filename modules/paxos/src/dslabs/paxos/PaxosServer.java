@@ -14,10 +14,11 @@ import dslabs.framework.Application;
 import dslabs.framework.Command;
 import dslabs.framework.Message;
 import dslabs.framework.Node;
+import dslabs.framework.Result;
+import dslabs.shardmaster.ShardMaster.Query;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
@@ -29,6 +30,7 @@ public class PaxosServer extends Node {
   private final Address[] servers;
 
   private final AMOApplication<Application> app;
+  private final Address parentAddr;
   private Ballot ballot_num;
   private Map<Integer, LogEntry> log;
   private Map<Integer, LogEntry> temp_log;
@@ -48,6 +50,25 @@ public class PaxosServer extends Node {
     super(address);
     this.servers = servers;
     this.app = new AMOApplication<>(app);
+    this.parentAddr = null;
+    this.ballot_num = new Ballot(0, address);
+    this.log = new HashMap<>();
+    this.temp_log = new HashMap<>();
+    this.active = false;
+    this.firstNotExec = 1;
+    this.firstEmpty = 1;
+    this.firstNonCleared = 1;
+    this.isLeaderAlive = false;
+    this.p1bResponses = new HashSet<>();
+    this.p2bResponses = new HashMap<>();
+    this.garbageCollect = new HashMap<>();
+  }
+
+  public PaxosServer(Address address, Address[] servers, Address parentAddr) {
+    super(address);
+    this.servers = servers;
+    this.app = null;
+    this.parentAddr = parentAddr;
     this.ballot_num = new Ballot(0, address);
     this.log = new HashMap<>();
     this.temp_log = new HashMap<>();
@@ -176,12 +197,25 @@ public class PaxosServer extends Node {
     AMOCommand cmd = m.command();
     // single server
     if (servers.length == 1) {
-      AMOResult result = app.execute(cmd);
-      send(new PaxosReply(result), sender);
+      if (app != null) {
+        AMOResult result = app.execute(cmd);
+        send(new PaxosReply(result), sender);
+        return;
+      } else {
+        // Lab 4
+        handleMessage(new PaxosDecision(cmd), parentAddr);
+        return;
+      }
+    }
+
+    // lab 4 special handling for Query
+    if (app != null && cmd.command() instanceof Query) {
+      Result result = app.application().execute(cmd.command());
+      send(new PaxosReply(new AMOResult(cmd.sequenceNum(), result)), sender);
       return;
     }
 
-    if (app.alreadyExecuted(cmd)) {
+    if (app != null && app.alreadyExecuted(cmd)) {
       // Send cached result
       AMOResult result = app.execute(cmd);
       send(new PaxosReply(result), sender);
@@ -189,10 +223,8 @@ public class PaxosServer extends Node {
     }
 
     // already proposed but haven't chosen to execute
-    for (int i = firstNotExec; i < firstEmpty; i++) {
-      if (log.get(i) != null && Objects.equals(log.get(i).command(), cmd)) {
-        return;
-      }
+    if (!cmd.readOnly() && log.values().stream().anyMatch(entry -> cmd.equals(entry.command()))) {
+      return;
     }
 
     int slot = firstEmpty++;
@@ -245,8 +277,6 @@ public class PaxosServer extends Node {
     mergeLog(m.log());
 
     if (p1bResponses.size() > (servers.length / 2)) {
-      //      System.out.println("New Leader: " + address());
-      //      System.out.println("firstEmpty: " + firstEmpty);
       active = true;
       for (int slot : temp_log.keySet()) {
         firstEmpty = Math.max(firstEmpty, slot + 1);
@@ -381,10 +411,6 @@ public class PaxosServer extends Node {
 
     executeCommands();
 
-    //    System.out.println("before garbage collect: " + log);
-    //    System.out.println("local firstNotClear: " + firstNonCleared());
-    //    System.out.println("firstNoneClear: " + m.firstNotCleared());
-
     // Garbage collect up to leader's first non-cleared slot
     if (m.firstNotCleared() > firstNonCleared) {
       for (int slot = firstNonCleared; slot < m.firstNotCleared(); slot++) {
@@ -392,8 +418,6 @@ public class PaxosServer extends Node {
       }
       firstNonCleared = m.firstNotCleared();
     }
-
-    //    System.out.println("after garbage collect: " + log);
 
     send(new HeartbeatReply(ballot_num, firstNotExec), sender);
   }
@@ -429,7 +453,7 @@ public class PaxosServer extends Node {
         }
       }
 
-      set(new HeartbeatTimer(), HEARTBEAT_MILLIS);
+      set(t, HEARTBEAT_MILLIS);
     }
   }
 
@@ -540,10 +564,14 @@ public class PaxosServer extends Node {
 
       AMOCommand cmd = entry.command();
       if (cmd != null) { // Could be a no-op
-        AMOResult result = app.execute(cmd);
+        if (app != null) {
+          AMOResult result = app.execute(cmd);
 
-        if (active && cmd.sender() != null) {
-          send(new PaxosReply(result), cmd.sender());
+          if (active && cmd.sender() != null) {
+            send(new PaxosReply(result), cmd.sender());
+          }
+        } else {
+          handleMessage(new PaxosDecision(cmd), parentAddr);
         }
       }
 
