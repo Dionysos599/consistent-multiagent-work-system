@@ -9,12 +9,17 @@ separately.
 
 Test harness and framework
 --------------------------
-The directory `jars/` contains the binaries of the course-provided testing
-framework ("dslabs") and its dependencies, and `run-tests.py` is a course-provided
-script (original author header preserved). These are the property of their
-respective authors, are NOT covered by any licence granted for the rest of this
-repository, and are included only so that the tests can be run locally.
-Third-party dependency licences are listed in `jars/THIRD-PARTY-NOTICES.txt`.
+The directory `jars/` contains the binaries of the testing framework ("dslabs")
+and its dependencies, and `run-tests.py` is part of the same framework (original
+author header preserved). The framework sources distributed with the course carry
+an MIT licence header ("Copyright (c) 2018-2022 Ellis Michael"); that notice
+applies to these files and must be kept with them. Third-party dependency
+licences are listed in `jars/THIRD-PARTY-NOTICES.txt`.
 
-Because the harness is course material, this repository is private and is not
-to be redistributed together with those binaries.
+The framework discovers test classes only in packages whose name starts with
+"dslabs". For that reason `modules/test-entries/` contains thin entry classes in
+the package `dslabs.cmws.entry`; all other code lives under `cmws.*`.
+
+The course test suites under `modules/*/tst` were adapted from the course
+handout (package names changed) and remain subject to the course's rules. This
+repository is private and is not to be redistributed.

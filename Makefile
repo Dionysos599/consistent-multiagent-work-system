@@ -30,19 +30,19 @@ all: $(OUT)/src/ $(OUT)/tst/
 
 $(OUT)/src/: $(JAVA_SRC)
 	@ mkdir -p $@
-	@ touch $@
 	@ if [ -n "$(strip $(JAVA_SRC))" ]; then \
 	    echo "[javac] $@"; \
 	    $(JC) -d $@ -cp "$(SRC_JARS)" $(JAVA_SRC); \
 	  fi
+	@ touch $@
 
 $(OUT)/tst/: $(JAVA_TST) $(OUT)/src
 	@ mkdir -p $@
-	@ touch $@
 	@ if [ -n "$(strip $(JAVA_TST))" ]; then \
 	    echo "[javac] $@"; \
 	    $(JC) -d $@ -cp "$(TST_JARS)$(SEP)$(OUT)/src" $(JAVA_TST); \
 	  fi
+	@ touch $@
 
 format:
 	@ echo "[format]"
