@@ -11,19 +11,27 @@ The project is built bottom-up:
 
 | Layer | Status | What it provides |
 |---|---|---|
-| 1. At-most-once RPC + key/value store | planned in Phase 0 | exactly-once command execution over an unreliable network |
-| 2. Primary-backup replication | planned in Phase 0 | single-failure tolerance with a view service |
-| 3. Multi-Paxos replicated state machine | planned in Phase 0 | majority-fault-tolerant, linearizable log |
-| 4. Sharded store with live reconfiguration | planned in Phase 0 | multiple replica groups, shard migration via a shard master |
+| 1. At-most-once RPC + key/value store | done | exactly-once command execution over an unreliable network |
+| 2. Primary-backup replication | done | single-failure tolerance with a view service |
+| 3. Multi-Paxos replicated state machine | done | majority-fault-tolerant, linearizable log |
+| 4. Sharded store with live reconfiguration | done | multiple replica groups, shard migration via a shard master |
 | 5. Versioned workspace (content-addressed objects + CAS refs) | next | fork / commit / merge on top of the store |
 | 6. Agent orchestration (planner, path leases, merge queue) | next | parallel sub-agents with serialized, validated merges |
 | 7. MCP server | later | expose the workspace to external agents |
 
-## Phase 0 (current)
+## Status
 
-Bring the replicated key/value store into this repository as a sequence of
-reviewable steps, then refactor it into a protocol core that is independent of
-the test harness (state machines in, effects out).
+Phase 0 is complete: the replicated key/value stack is in this repository, its
+protocol logic lives in pure state machines (`PaxosCore`, `ShardStoreCore`) that
+return effects instead of performing I/O, and the test suites for layers 1–4
+pass. (Cross-group multi-key transactions are out of scope; their suite under
+`ShardStorePart2Test` is not expected to pass.) Along the
+way an intermittent liveness bug in shard reconfiguration (a retry suppressed by
+log de-duplication, which deadlocked a reconfiguration whenever a replica was
+down) was found and fixed.
+
+Next: hardening the store and adding compare-and-set, then the versioned
+workspace layer.
 
 ## Build
 
@@ -39,8 +47,9 @@ Tests are run through `run-tests.py` (see `NOTICE` for where the harness comes f
 ## Layout
 
 ```
-modules/<name>/src   implementation
+modules/<name>/src   implementation (protocol cores + framework adapters)
 modules/<name>/tst   tests
+modules/test-entries test discovery entry points (see NOTICE)
 docs/                design documents
 jars/                third-party and test-harness binaries
 ```
