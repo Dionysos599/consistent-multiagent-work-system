@@ -138,6 +138,11 @@ public class ShardStoreClient extends ShardStoreNode implements Client {
       // from " + sender);
       if (shardConfig == null || newConfig.configNum() > shardConfig.configNum()) {
         shardConfig = newConfig;
+        // A pending request may have been sent to the wrong group (or never sent at all because
+        // the configuration was unknown): send it right away rather than waiting for the timer.
+        if (pendingCommand != null && pendingResult == null) {
+          resendCurrentCommand();
+        }
       }
     }
     // If Error, timer will retry automatically
