@@ -1,6 +1,7 @@
 package cmws.shardkv;
 
 import cmws.core.Effect;
+import cmws.core.StoreProvider;
 import cmws.core.Send;
 import cmws.core.SetTimer;
 import cmws.paxos.PaxosDecision;
@@ -8,6 +9,7 @@ import cmws.paxos.PaxosReply;
 import cmws.paxos.PaxosRequest;
 import cmws.paxos.PaxosServer;
 import dslabs.framework.Address;
+import java.io.IOException;
 import java.util.List;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
@@ -25,13 +27,27 @@ public class ShardStoreServer extends ShardStoreNode {
   private final ShardStoreCore core;
   private Address paxosAddress;
 
+  /** Where the group's Paxos sub-node keeps its stable storage; null for a volatile replica. */
+  @ToString.Exclude private final transient StoreProvider stores;
+
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
    * ---------------------------------------------------------------------------------------------*/
-  ShardStoreServer(
+  public ShardStoreServer(
       Address address, Address[] shardMasters, int numShards, Address[] group, int groupId) {
+    this(address, shardMasters, numShards, group, groupId, null);
+  }
+
+  public ShardStoreServer(
+      Address address,
+      Address[] shardMasters,
+      int numShards,
+      Address[] group,
+      int groupId,
+      StoreProvider stores) {
     super(address, shardMasters, numShards);
     this.core = new ShardStoreCore(address, shardMasters, numShards, group, groupId);
+    this.stores = stores;
   }
 
   @Override
@@ -44,9 +60,24 @@ public class ShardStoreServer extends ShardStoreNode {
       paxosAddresses[i] = Address.subAddress(group[i], PAXOS_ADDRESS_ID);
     }
 
-    PaxosServer paxosServer = new PaxosServer(paxosAddress, paxosAddresses, address());
+    PaxosServer paxosServer;
+    try {
+      paxosServer =
+          new PaxosServer(
+              paxosAddress,
+              paxosAddresses,
+              address(),
+              stores == null ? null : stores.open(paxosAddress));
+    } catch (IOException e) {
+      throw new IllegalStateException("cannot open stable storage", e);
+    }
     addSubNode(paxosServer);
+
+    // With stable storage the sub-node replays its log here, and every decision it delivers
+    // rebuilds this server's state. Those decisions are history, not new events.
+    core.beginReplay();
     paxosServer.init();
+    core.endReplay();
 
     apply(core.start());
   }

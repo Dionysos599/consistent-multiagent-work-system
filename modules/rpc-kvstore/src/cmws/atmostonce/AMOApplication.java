@@ -42,13 +42,16 @@ public final class AMOApplication<T extends Application> implements Application 
 
     // Outdated command that we haven't seen before
     if (highestSeqNum != null && sequenceNum < highestSeqNum && !amoCommand.readOnly()) {
+      // The client has already issued a newer command, so nobody is waiting for this one. It must
+      // not be executed: for anything but a plain put or append (a compare-and-set, say) running
+      // it late would change state the client never asked to change.
       Result dummyResult;
       if (amoCommand.command() instanceof KVStore.Put) {
         dummyResult = new KVStore.PutOk();
       } else if (amoCommand.command() instanceof KVStore.Append) {
         dummyResult = new KVStore.AppendResult("dummy");
       } else {
-        dummyResult = application.execute(amoCommand.command());
+        dummyResult = new StaleCommand();
       }
 
       if (!results.containsKey(clientAddress)) {

@@ -5,6 +5,7 @@ import dslabs.framework.Command;
 import dslabs.framework.Result;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 import lombok.Data;
 import lombok.EqualsAndHashCode;
 import lombok.NonNull;
@@ -42,6 +43,27 @@ public class KVStore implements Application {
     @NonNull private final String key, value;
   }
 
+  /**
+   * Store {@code value} only if {@code key} has no value yet. This is the primitive that lets
+   * clients claim a name (an object, a lock, a task) exactly once.
+   */
+  @Data
+  public static final class PutIfAbsent implements SingleKeyCommand {
+    @NonNull private final String key, value;
+  }
+
+  /**
+   * Replace the value of {@code key} with {@code value} only if it currently equals {@code
+   * expected}. A {@code null} {@code expected} means "only if the key is absent". This is the
+   * single linearizable write that moves a reference (a branch head) from one version to the next.
+   */
+  @Data
+  public static final class CompareAndSet implements SingleKeyCommand {
+    @NonNull private final String key;
+    private final String expected; // null: the key must not exist
+    @NonNull private final String value;
+  }
+
   public interface KVStoreResult extends Result {}
 
   @Data
@@ -58,6 +80,17 @@ public class KVStore implements Application {
   @Data
   public static final class AppendResult implements KVStoreResult {
     @NonNull private final String value;
+  }
+
+  /**
+   * Outcome of a conditional write. {@code value} is what the key holds after the operation: the
+   * new value on success, the value that was in the way on failure ({@code null} if the key does
+   * not exist).
+   */
+  @Data
+  public static final class ConditionalResult implements KVStoreResult {
+    private final boolean success;
+    private final String value;
   }
 
   @Override
@@ -85,6 +118,25 @@ public class KVStore implements Application {
       return new AppendResult(newValue);
     }
 
+    if (command instanceof PutIfAbsent) {
+      PutIfAbsent p = (PutIfAbsent) command;
+      return compareAndSet(p.key(), null, p.value());
+    }
+
+    if (command instanceof CompareAndSet) {
+      CompareAndSet c = (CompareAndSet) command;
+      return compareAndSet(c.key(), c.expected(), c.value());
+    }
+
     throw new IllegalArgumentException();
+  }
+
+  private ConditionalResult compareAndSet(String key, String expected, String value) {
+    String current = map.get(key);
+    if (Objects.equals(current, expected)) {
+      map.put(key, value);
+      return new ConditionalResult(true, value);
+    }
+    return new ConditionalResult(false, current);
   }
 }

@@ -11,6 +11,7 @@ import static cmws.paxos.PaxosLogSlotStatus.EMPTY;
 
 import cmws.atmostonce.AMOCommand;
 import cmws.core.Effect;
+import cmws.core.Persist;
 import cmws.core.Send;
 import cmws.core.SetTimer;
 import dslabs.framework.Address;
@@ -43,6 +44,13 @@ final class PaxosCore implements Serializable {
   /** All servers in the Paxos group, including this one. */
   private final Address[] servers;
 
+  /**
+   * Durable mode: every change to the acceptor state is announced as a {@link Persist} effect, and
+   * the log is never garbage-collected, because replaying it is how the application state is
+   * rebuilt after a restart.
+   */
+  private final boolean durable;
+
   private Ballot ballot_num;
   private Map<Integer, LogEntry> log;
   private Map<Integer, LogEntry> temp_log;
@@ -55,9 +63,23 @@ final class PaxosCore implements Serializable {
   private final Map<Integer, Set<Address>> p2bResponses;
   private final Map<Address, Integer> garbageCollect;
 
+  /**
+   * Leader only: the first slot each follower has not executed yet, as last reported in its
+   * heartbeat replies. Heartbeats only carry chosen entries from there on.
+   */
+  private final Map<Address, Integer> followerProgress;
+
+  /** Upper bound on the chosen entries one heartbeat carries, so that it stays small. */
+  private static final int MAX_HEARTBEAT_ENTRIES = 128;
+
   PaxosCore(Address self, Address[] servers) {
+    this(self, servers, false);
+  }
+
+  PaxosCore(Address self, Address[] servers, boolean durable) {
     this.self = self;
     this.servers = servers;
+    this.durable = durable;
     this.ballot_num = new Ballot(0, self);
     this.log = new HashMap<>();
     this.temp_log = new HashMap<>();
@@ -69,6 +91,7 @@ final class PaxosCore implements Serializable {
     this.p1bResponses = new HashSet<>();
     this.p2bResponses = new HashMap<>();
     this.garbageCollect = new HashMap<>();
+    this.followerProgress = new HashMap<>();
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -111,6 +134,50 @@ final class PaxosCore implements Serializable {
 
   int lastNonEmpty() {
     return firstEmpty - 1;
+  }
+
+  /* -----------------------------------------------------------------------------------------------
+   *  Durability
+   * ---------------------------------------------------------------------------------------------*/
+  private void persist(List<Effect> out, java.io.Serializable record) {
+    if (durable) {
+      out.add(new Persist(record));
+    }
+  }
+
+  /** Rebuild the acceptor state from the records a previous incarnation wrote. */
+  void restore(List<java.io.Serializable> records) {
+    for (java.io.Serializable r : records) {
+      if (r instanceof PaxosRecords.Promise p) {
+        if (p.ballot().compareTo(ballot_num) > 0) {
+          ballot_num = p.ballot();
+        }
+      } else if (r instanceof PaxosRecords.Accept a) {
+        LogEntry existing = log.get(a.slot());
+        if (existing == null || existing.status() != CHOSEN) {
+          LogEntry entry = new LogEntry();
+          entry.ballot(a.ballot());
+          entry.status(ACCEPTED);
+          entry.command(a.command());
+          log.put(a.slot(), entry);
+        }
+        firstEmpty = Math.max(firstEmpty, a.slot() + 1);
+      } else if (r instanceof PaxosRecords.Learn l) {
+        LogEntry entry = new LogEntry();
+        entry.ballot(l.ballot());
+        entry.status(CHOSEN);
+        entry.command(l.command());
+        log.put(l.slot(), entry);
+        firstEmpty = Math.max(firstEmpty, l.slot() + 1);
+      }
+    }
+  }
+
+  /** After {@link #restore}: execute, in order, everything known to be decided. */
+  List<Effect> replay() {
+    List<Effect> out = new ArrayList<>();
+    executeCommands(out);
+    return out;
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -189,6 +256,12 @@ final class PaxosCore implements Serializable {
       }
       log = new HashMap<>(temp_log);
       temp_log.clear();
+      for (Map.Entry<Integer, LogEntry> learned : log.entrySet()) {
+        if (learned.getValue().status() == CHOSEN) {
+          LogEntry e = learned.getValue();
+          persist(out, new PaxosRecords.Learn(learned.getKey(), e.ballot(), e.command()));
+        }
+      }
 
       // Fill any holes with no-ops
       for (int slot = firstNotExec; slot < firstEmpty; slot++) {
@@ -250,6 +323,7 @@ final class PaxosCore implements Serializable {
       LogEntry entry = log.get(m.slotNum());
       if (entry != null) {
         entry.status(CHOSEN);
+        persist(out, new PaxosRecords.Learn(m.slotNum(), entry.ballot(), entry.command()));
       }
       executeCommands(out);
     }
@@ -268,6 +342,7 @@ final class PaxosCore implements Serializable {
       return out;
     }
 
+    followerProgress.merge(sender, m.firstNotExec(), Math::max);
     garbageCollect.put(sender, m.firstNotExec());
     garbageCollect.putIfAbsent(self, firstNotExec);
     if (garbageCollect.size() == servers.length) {
@@ -282,18 +357,23 @@ final class PaxosCore implements Serializable {
   List<Effect> onHeartbeatTimer(HeartbeatTimer t) {
     List<Effect> out = new ArrayList<>();
     if (active) {
-      // Only include CHOSEN entries to reduce message size
-      Map<Integer, LogEntry> chosenLog = new HashMap<>();
-      for (Map.Entry<Integer, LogEntry> entry : log.entrySet()) {
-        if (entry.getValue().status() == CHOSEN) {
-          chosenLog.put(entry.getKey(), entry.getValue());
-        }
-      }
-
       for (Address server : servers) {
-        if (!server.equals(self)) {
-          out.add(new Send(new HeartbeatRequest(ballot_num, chosenLog, firstNonCleared), server));
+        if (server.equals(self)) {
+          continue;
         }
+
+        // Only what this follower has not executed yet. Sending the whole chosen log made every
+        // heartbeat grow with the age of the system, and with a replica down nothing is ever
+        // garbage-collected, so the log (and the heartbeat) would grow without bound.
+        int from = Math.max(firstNonCleared, followerProgress.getOrDefault(server, firstNonCleared));
+        Map<Integer, LogEntry> chosen = new HashMap<>();
+        for (int slot = from; slot < firstEmpty && chosen.size() < MAX_HEARTBEAT_ENTRIES; slot++) {
+          LogEntry entry = log.get(slot);
+          if (entry != null && entry.status() == CHOSEN) {
+            chosen.put(slot, entry);
+          }
+        }
+        out.add(new Send(new HeartbeatRequest(ballot_num, chosen, firstNonCleared), server));
       }
 
       out.add(new SetTimer(t, HEARTBEAT_MILLIS));
@@ -346,10 +426,12 @@ final class PaxosCore implements Serializable {
       // new leader
       if (m.ballot().compareTo(ballot_num) > 0) {
         ballot_num = m.ballot();
+        persist(out, new PaxosRecords.Promise(ballot_num));
         active = false;
         p1bResponses.clear();
         p2bResponses.clear();
         garbageCollect.clear();
+        followerProgress.clear();
         // The single CheckHeartbeatTimer chain started in start() keeps running; starting another
         // chain here made the check interval shrink with every ballot change.
       }
@@ -366,11 +448,13 @@ final class PaxosCore implements Serializable {
       if (!m.ballot().equals(ballot_num)) {
         // If strictly higher ballot, update and step down if leader
         ballot_num = m.ballot();
+        persist(out, new PaxosRecords.Promise(ballot_num));
         if (active) {
           active = false;
           p1bResponses.clear();
           p2bResponses.clear();
           garbageCollect.clear();
+          followerProgress.clear();
         }
       }
 
@@ -391,6 +475,7 @@ final class PaxosCore implements Serializable {
       entry.command(m.command());
       log.put(m.slotNum(), entry);
       firstEmpty = Math.max(firstEmpty, m.slotNum() + 1);
+      persist(out, new PaxosRecords.Accept(m.slotNum(), m.ballot(), m.command()));
 
       if (!sender.equals(self)) {
         out.add(new Send(new P2B(ballot_num, m.slotNum()), sender));
@@ -405,11 +490,13 @@ final class PaxosCore implements Serializable {
 
     if (m.ballot().compareTo(ballot_num) > 0) {
       ballot_num = m.ballot();
+      persist(out, new PaxosRecords.Promise(ballot_num));
       if (active) {
         active = false;
         p1bResponses.clear();
         p2bResponses.clear();
         garbageCollect.clear();
+        followerProgress.clear();
       }
     }
 
@@ -430,6 +517,7 @@ final class PaxosCore implements Serializable {
         myEntry.status(CHOSEN);
         myEntry.command(leaderEntry.command());
         log.put(slot, myEntry);
+        persist(out, new PaxosRecords.Learn(slot, leaderEntry.ballot(), leaderEntry.command()));
       }
 
       firstEmpty = Math.max(firstEmpty, slot + 1);
@@ -437,8 +525,8 @@ final class PaxosCore implements Serializable {
 
     executeCommands(out);
 
-    // Garbage collect up to leader's first non-cleared slot
-    if (m.firstNotCleared() > firstNonCleared) {
+    // Garbage collect up to leader's first non-cleared slot (never in durable mode)
+    if (!durable && m.firstNotCleared() > firstNonCleared) {
       for (int slot = firstNonCleared; slot < m.firstNotCleared(); slot++) {
         log.remove(slot);
       }
@@ -455,10 +543,12 @@ final class PaxosCore implements Serializable {
   /** Start the first phase of Paxos: called when this server decides to run for leader. */
   private void startPhase1(List<Effect> out) {
     ballot_num = new Ballot(ballot_num.round() + 1, self);
+    persist(out, new PaxosRecords.Promise(ballot_num));
     active = false;
     p1bResponses.clear();
     p2bResponses.clear();
     garbageCollect.clear();
+    followerProgress.clear();
     temp_log = new HashMap<>(log); // Initialize temp_log with your current log
 
     // Count own vote
@@ -540,7 +630,7 @@ final class PaxosCore implements Serializable {
 
   /** Garbage collect slots every server has executed (needs a heartbeat reply from all). */
   private void collectGarbage() {
-    if (garbageCollect.size() < servers.length) {
+    if (durable || garbageCollect.size() < servers.length) {
       return;
     }
 

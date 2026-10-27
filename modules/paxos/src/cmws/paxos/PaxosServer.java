@@ -3,7 +3,9 @@ package cmws.paxos;
 import cmws.atmostonce.AMOApplication;
 import cmws.atmostonce.AMOCommand;
 import cmws.atmostonce.AMOResult;
+import cmws.core.DurableStore;
 import cmws.core.Effect;
+import cmws.core.Persist;
 import cmws.core.Send;
 import cmws.core.SetTimer;
 import cmws.shardmaster.ShardMaster.Query;
@@ -12,6 +14,9 @@ import dslabs.framework.Application;
 import dslabs.framework.Command;
 import dslabs.framework.Node;
 import dslabs.framework.Result;
+import java.io.IOException;
+import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.List;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
@@ -31,25 +36,51 @@ public class PaxosServer extends Node {
   private final Address parentAddr;
   private final PaxosCore core;
 
+  /** Stable storage, or null for a volatile replica (the default, and always in search tests). */
+  @ToString.Exclude private final transient DurableStore store;
+
   /* -----------------------------------------------------------------------------------------------
    *  Construction and Initialization
    * ---------------------------------------------------------------------------------------------*/
   public PaxosServer(Address address, Address[] servers, Application app) {
-    super(address);
-    this.app = new AMOApplication<>(app);
-    this.parentAddr = null;
-    this.core = new PaxosCore(address, servers);
+    this(address, servers, app, null);
   }
 
   public PaxosServer(Address address, Address[] servers, Address parentAddr) {
+    this(address, servers, parentAddr, null);
+  }
+
+  /** A complete replicated state machine whose acceptor state survives restarts. */
+  public PaxosServer(Address address, Address[] servers, Application app, DurableStore store) {
+    super(address);
+    this.app = new AMOApplication<>(app);
+    this.parentAddr = null;
+    this.store = store;
+    this.core = new PaxosCore(address, servers, store != null);
+  }
+
+  /** A sub-node whose decisions go to {@code parentAddr}; its acceptor state survives restarts. */
+  public PaxosServer(Address address, Address[] servers, Address parentAddr, DurableStore store) {
     super(address);
     this.app = null;
     this.parentAddr = parentAddr;
-    this.core = new PaxosCore(address, servers);
+    this.store = store;
+    this.core = new PaxosCore(address, servers, store != null);
   }
 
   @Override
   public void init() {
+    if (store != null) {
+      try {
+        List<Serializable> records = store.readAll();
+        if (!records.isEmpty()) {
+          core.restore(records);
+          apply(core.replay());
+        }
+      } catch (IOException e) {
+        throw new IllegalStateException("cannot recover from stable storage", e);
+      }
+    }
     apply(core.start());
   }
 
@@ -182,7 +213,26 @@ public class PaxosServer extends Node {
    *  Effects
    * ---------------------------------------------------------------------------------------------*/
   private void apply(List<Effect> effects) {
+    // Everything that must be durable is written first, before any message goes out or any
+    // command is applied: a promise or an acceptance must never be visible before it is on disk.
+    if (store != null) {
+      List<Serializable> records = new ArrayList<>();
+      for (Effect effect : effects) {
+        if (effect instanceof Persist p) {
+          records.add(p.record());
+        }
+      }
+      try {
+        store.append(records);
+      } catch (IOException e) {
+        throw new IllegalStateException("cannot write to stable storage", e);
+      }
+    }
+
     for (Effect effect : effects) {
+      if (effect instanceof Persist) {
+        continue;
+      }
       if (effect instanceof Send s) {
         send(s.message(), s.to());
       } else if (effect instanceof SetTimer t) {

@@ -51,6 +51,9 @@ final class ShardStoreCore implements Serializable {
   private Map<Integer, Set<Integer>> shardToSend; // groupId -> shards to send
   private Set<Integer> shardToReceive;
 
+  /** True while decisions from before a restart are being replayed. */
+  private boolean replaying;
+
   ShardStoreCore(
       Address self, Address[] shardMasters, int numShards, Address[] group, int groupId) {
     this.self = self;
@@ -66,6 +69,19 @@ final class ShardStoreCore implements Serializable {
 
   Address[] group() {
     return group;
+  }
+
+  /**
+   * Decisions that are replayed after a restart rebuild the state but must not talk to anyone: the
+   * clients and groups they would answer belong to the previous run. Whatever the other side still
+   * needs is resent by the normal retry timers.
+   */
+  void beginReplay() {
+    replaying = true;
+  }
+
+  void endReplay() {
+    replaying = false;
   }
 
   /* -----------------------------------------------------------------------------------------------
@@ -160,6 +176,9 @@ final class ShardStoreCore implements Serializable {
       applyShardMove(((ProcessShardMove) cmd).shardMove(), out);
     } else if (cmd instanceof ProcessShardMoveAck) {
       applyShardMoveAck(((ProcessShardMoveAck) cmd).ack());
+    }
+    if (replaying) {
+      out.removeIf(e -> e instanceof Send);
     }
     return out;
   }
@@ -295,7 +314,8 @@ final class ShardStoreCore implements Serializable {
   }
 
   private void applyShardMoveAck(ShardMoveAck ack) {
-    if (ack.configNum() != shardConfig.configNum()
+    if (shardConfig == null
+        || ack.configNum() != shardConfig.configNum()
         || !isReconfiguring
         || !shardToSend.containsKey(ack.groupId())) {
       return;

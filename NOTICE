@@ -23,3 +23,6 @@ the package `dslabs.cmws.entry`; all other code lives under `cmws.*`.
 The course test suites under `modules/*/tst` were adapted from the course
 handout (package names changed) and remain subject to the course's rules. This
 repository is private and is not to be redistributed.
+
+The HTTP gateway (`modules/gateway`) runs its cluster on the framework's in-process runtime
+(`RunState`, part of the harness jars), so it is compiled together with the tests.
