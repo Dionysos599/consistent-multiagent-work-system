@@ -15,7 +15,7 @@ The project is built bottom-up:
 | 2. Primary-backup replication | done | single-failure tolerance with a view service |
 | 3. Multi-Paxos replicated state machine | done | majority-fault-tolerant, linearizable log |
 | 4. Sharded store with live reconfiguration | done | multiple replica groups, shard migration via a shard master |
-| 5. Versioned workspace (content-addressed objects + CAS refs) | next | fork / commit / merge on top of the store |
+| 5. Versioned workspace (content-addressed objects + CAS refs) | done | fork / commit / three-way merge / stale-read detection on top of the store |
 | 6. Agent orchestration (planner, path leases, merge queue) | next | parallel sub-agents with serialized, validated merges |
 | 7. MCP server | later | expose the workspace to external agents |
 
@@ -35,7 +35,20 @@ deadlocked a reconfiguration whenever a replica was down) was found and fixed.
 - an HTTP gateway over an in-process sharded, replicated cluster, with replica fault injection;
 - optional durability: a write-ahead log per replica, so a restarted cluster recovers its data.
 
-Next: the versioned workspace layer (content-addressed objects plus compare-and-set references).
+**Phase 2 (done)** – the versioned workspace engine (`workspace/`, Python, standard library only):
+
+- immutable content-addressed blobs, trees and commits; a fork is one ref, no copying;
+- refs moved only by compare-and-set, so landed work forms a single history;
+- workspaces with private overlays, read-your-writes, commit, rollback and resume after a crash;
+- three-way merge of directory trees with line-level diff3 for text files; renames (recorded by
+  the workspace or detected from content) carry other agents' edits to the new path;
+- large files stored as chunks; a measure of unreachable (garbage) storage;
+- `submit`: merge, then CAS main; retries on top of whatever landed in the meantime;
+- stale-read detection: an agent whose reads were invalidated upstream is told so even when
+  its edits do not overlap anyone else's. In a read-modify-write counter test with 8
+  concurrent agents, skipping this check silently loses a large share of the increments; with it, none.
+
+Next: local sync, then agent orchestration (workers, task graph, merge queue).
 
 (Cross-group multi-key transactions are out of scope; their suite under
 `ShardStorePart2Test` is not expected to pass.)
@@ -49,6 +62,7 @@ make            # compile all modules
 make clean
 python3 run-tests.py -l 5        # this project's own tests (unit, integration, gateway, durability)
 python3 run-tests.py -l 4 -p 2   # sharded store suite (also -l 1 .. -l 3)
+make test-workspace              # workspace engine tests, including runs against the real gateway
 ```
 
 See `NOTICE` for where the test harness comes from.
@@ -80,6 +94,7 @@ key holds afterwards.
 modules/rpc-kvstore  at-most-once layer, key/value store, effect types (cmws.core)
 modules/primary-backup, modules/paxos, modules/sharded-kv   the replication stack
 modules/gateway      HTTP front end and in-process cluster
+workspace/           versioned workspace engine (Python): objects, refs, merge, submit
 modules/test-entries test discovery entry points (see NOTICE)
 docs/design/         design documents
 jars/                third-party and test-harness binaries

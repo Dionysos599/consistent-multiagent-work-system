@@ -54,6 +54,11 @@ run-gateway: all
 	    --add-opens java.base/java.time=ALL-UNNAMED \
 	    -cp "$(TST_JARS)$(SEP)$(OUT)/src$(SEP)$(OUT)/tst" cmws.gateway.GatewayMain $(ARGS)
 
+# The workspace engine (Python, standard library only). Its integration tests start the gateway.
+.PHONY: test-workspace
+test-workspace: all
+	@ cd workspace && PYTHONPATH=src python3 -m unittest discover -s tests -t .
+
 format:
 	@ echo "[format]"
 	@ java -jar jars/google-java-format.jar -i $(JAVA_SRC)

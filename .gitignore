@@ -22,3 +22,7 @@ Desktop.ini
 # Local-only handoff notes
 docs/plan.md
 CLAUDE.md
+
+# Python
+__pycache__/
+*.pyc
