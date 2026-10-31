@@ -21,6 +21,7 @@ from cmws_ws.repo import Repository
 from tests.support import check_linear_history
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SRC = os.path.join(ROOT, "workspace", "src")
 
 
 def free_port():
@@ -127,6 +128,42 @@ class GatewayIntegrationTest(unittest.TestCase):
         self.assertTrue(repo.submit(ws).landed)
         fresh = Repository(self.kv(), main=name)
         self.assertEqual(fresh.main_files()["data/model.bin"], data)
+
+    def test_folder_sync_and_cli_against_the_real_cluster(self):
+        import tempfile
+        from pathlib import Path
+        name = f"main-{time.time_ns()}"
+        agent = f"cli{time.time_ns()}"
+        work = Path(tempfile.mkdtemp())
+        project = work / "project"
+        (project / "src").mkdir(parents=True)
+        (project / "src/app.py").write_text("print('v1')\n")
+        (project / "README.md").write_text("# demo\n")
+        (project / "__pycache__").mkdir()
+        (project / "__pycache__/junk.pyc").write_text("junk")
+
+        def cli(*args):
+            r = subprocess.run([sys.executable, "-m", "cmws_ws.cli", "--url", self.base,
+                                "--main", name, *args], capture_output=True, text=True,
+                               env={**os.environ, "PYTHONPATH": SRC}, cwd=work)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return r.stdout
+
+        cli("init", "--from", str(project))
+        cli("clone", agent, str(work / "mine"))
+        mine = work / "mine"
+        self.assertEqual((mine / "src/app.py").read_text(), "print('v1')\n")
+        self.assertFalse((mine / "__pycache__").exists())
+        (mine / "src/app.py").write_text("print('v2')\n")
+        (mine / "notes.txt").write_text("hello\n")
+        self.assertIn("M src/app.py", cli("status", str(mine)))
+        self.assertIn("pushed", cli("push", str(mine), "-m", "my edits"))
+        out = cli("submit", str(mine))
+        self.assertRegex(out, "fast-forward|merged")
+        repo = Repository(self.kv(), main=name)
+        self.assertEqual(repo.main_files()["src/app.py"], b"print('v2')\n")
+        self.assertIn("my edits", cli("log"))        # the pushed commit is what landed on main
+        shutil.rmtree(work, ignore_errors=True)
 
     def test_work_survives_losing_a_replica_per_group_and_a_fresh_client_sees_it(self):
         kv = self.kv()

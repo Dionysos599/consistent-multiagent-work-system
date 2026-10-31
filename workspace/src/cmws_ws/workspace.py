@@ -28,7 +28,12 @@ from .treemerge import PathConflictInfo, merge_trees
 
 
 class ConcurrentWorkspaceUpdate(Exception):
-    """The workspace branch moved underneath this handle (another writer on the same branch)."""
+    """The workspace branch moved underneath this handle and the other writer's changes could not
+    be merged with ours; ``conflicts`` says where. Nothing was changed."""
+
+    def __init__(self, message: str, conflicts=()) -> None:
+        super().__init__(message)
+        self.conflicts = list(conflicts)
 
 
 class DirtyWorkspace(Exception):
@@ -278,10 +283,11 @@ class Workspace:
         tree = self.store.update(self._head_tree, changes)
         cid = self.store.put_commit(Commit(tree, (self.head,), self.agent_id, message,
                                            self.repo.clock(), self._recorded_moves(pending)))
-        self._advance(cid)
+        self.repo.save_meta(self, cid)
+        self._publish(cid)
         self._overlay.clear()
         self._moves.clear()
-        return cid
+        return self.head
 
     def _recorded_moves(self, pending: Dict[str, Optional[bytes]]) -> Tuple[Tuple[str, str], ...]:
         """Moves worth recording: the old path really went away, the new one really appeared,
@@ -294,11 +300,43 @@ class Workspace:
                 out.append((src, dst))
         return tuple(out)
 
-    def _advance(self, new_head: str) -> None:
-        self.repo.save_meta(self, new_head)
-        if not self.repo.refs.cas(self.ref_name, self.head, new_head).ok:
-            raise ConcurrentWorkspaceUpdate(self.ref_name)
-        self.head = new_head
+    def _publish(self, new_head: str) -> None:
+        """Make ``new_head`` the branch tip. The branch may have other writers (a local checkout
+        pushing, a second agent); if it moved since this handle last looked, their work is merged
+        in first, so nobody's commits are dropped. Raises ConcurrentWorkspaceUpdate, changing
+        nothing, if the two cannot be merged."""
+        ref = self.ref_name
+        for _ in range(self.repo.max_attempts):
+            tip = self.repo.refs.get(ref)
+            if tip == new_head:
+                self.head = new_head
+                return
+            if tip is None or tip == self.head or is_ancestor(self.store, tip, new_head):
+                if self.repo.refs.cas(ref, tip, new_head).ok:
+                    self.head = new_head
+                    return
+                continue
+            merged = self.repo.merge_into(new_head, tip, "ours", ref)
+            if not merged.clean:
+                raise ConcurrentWorkspaceUpdate(
+                    f"{ref} moved and its changes conflict with ours", merged.conflicts)
+            new_head = self.store.put_commit(Commit(
+                merged.tree, (new_head, tip), self.agent_id, f"Merge concurrent work on {ref}",
+                self.repo.clock()))
+        raise ConcurrentWorkspaceUpdate(f"{ref} is too contended")
+
+    def refresh(self) -> bool:
+        """Pick up commits others (a local checkout, another agent) added to this branch.
+        Needs a clean overlay, so that those commits do not silently sit under pending edits."""
+        if self.dirty:
+            raise DirtyWorkspace("commit or roll back edits before refreshing")
+        tip = self.repo.refs.get(self.ref_name)
+        if tip is None or tip == self.head:
+            return False
+        if not is_ancestor(self.store, self.head, tip):
+            raise ConcurrentWorkspaceUpdate(f"{self.ref_name} no longer contains our head")
+        self.head = tip
+        return True
 
     def rollback(self, to: Optional[str] = None) -> None:
         """Drop uncommitted edits; with ``to``, also move back to an earlier commit of this branch."""
@@ -309,7 +347,10 @@ class Workspace:
         if not is_ancestor(self.store, self.fork_base, to) or not is_ancestor(
                 self.store, to, self.head):
             raise ValueError("can only roll back to a commit between the fork base and the head")
-        self._advance(to)
+        self.repo.save_meta(self, to)
+        if not self.repo.refs.cas(self.ref_name, self.head, to).ok:
+            raise ConcurrentWorkspaceUpdate(f"{self.ref_name} moved; not rolling back over it")
+        self.head = to
 
     # ---- catching up with upstream -------------------------------------------------------
 
@@ -322,6 +363,7 @@ class Workspace:
         """
         if self.dirty:
             raise DirtyWorkspace("commit or roll back edits before syncing")
+        self.refresh()
         upstream = self.repo.head()
         if upstream == self.fork_base or upstream in ancestors(self.store, self.head):
             return SyncResult("up-to-date")
@@ -340,7 +382,6 @@ class Workspace:
 
     def _adopt(self, new_head: str, new_fork_base: str) -> None:
         self.repo.save_meta(self, new_head, fork_base=new_fork_base, reads={}, listings={})
-        if not self.repo.refs.cas(self.ref_name, self.head, new_head).ok:
-            raise ConcurrentWorkspaceUpdate(self.ref_name)
-        self.head, self.fork_base = new_head, new_fork_base
+        self._publish(new_head)
+        self.fork_base = new_fork_base
         self.reads, self.listings = {}, {}

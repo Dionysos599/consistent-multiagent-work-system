@@ -126,15 +126,36 @@ class WorkspaceTest(unittest.TestCase):
         with self.assertRaises(MissingObject):
             ws.rollback(to=repo.head() + "x")
 
-    def test_second_writer_on_the_same_branch_is_rejected(self):
+    def test_second_writer_on_the_same_branch_is_merged(self):
         repo = new_repo()
         ws = repo.fork("a")
         twin = repo.resume("a")
         ws.write("x", "1")
-        ws.commit("one")
+        first = ws.commit("one")
         twin.write("y", "2")
-        with self.assertRaises(ConcurrentWorkspaceUpdate):
+        merged = twin.commit("two")                      # branch moved: merged, not rejected
+        self.assertNotEqual(merged, first)
+        self.assertEqual(repo.refs.get("ws/a"), merged)
+        self.assertEqual(sorted(set(repo.files_at(merged)) - set(BASE)), ["x", "y"])
+        self.assertEqual(len(repo.store.get_commit(merged).parents), 2)
+        self.assertTrue(ws.refresh())                    # the first handle catches up
+        self.assertEqual(ws.head, merged)
+        self.assertFalse(ws.refresh())
+
+    def test_second_writer_with_conflicting_edit_is_rejected_and_unchanged(self):
+        repo = new_repo()
+        ws = repo.fork("a")
+        twin = repo.resume("a")
+        ws.write("README.md", "mine\n")
+        tip = ws.commit("one")
+        twin.write("README.md", "theirs\n")
+        with self.assertRaises(ConcurrentWorkspaceUpdate) as ctx:
             twin.commit("two")
+        self.assertEqual([c.path for c in ctx.exception.conflicts], ["README.md"])
+        self.assertEqual(repo.refs.get("ws/a"), tip)     # branch untouched
+        self.assertEqual(twin.read_text("README.md"), "theirs\n")   # pending edit still there
+        with self.assertRaises(DirtyWorkspace):
+            twin.refresh()
 
     def test_resume_after_crash_keeps_commits_and_reads(self):
         repo = new_repo()

@@ -179,6 +179,7 @@ class Repository:
         """
         if ws.dirty:
             ws.commit(message or f"Work by {ws.agent_id}")
+        ws.refresh()   # include whatever other writers of this branch (a local checkout) pushed
         result = SubmitResult("noop")
         for attempt in range(1, self.max_attempts + 1):
             result.attempts = attempt

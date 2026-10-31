@@ -16,6 +16,7 @@ The project is built bottom-up:
 | 3. Multi-Paxos replicated state machine | done | majority-fault-tolerant, linearizable log |
 | 4. Sharded store with live reconfiguration | done | multiple replica groups, shard migration via a shard master |
 | 5. Versioned workspace (content-addressed objects + CAS refs) | done | fork / commit / three-way merge / stale-read detection on top of the store |
+| 5b. Local sync | done | a real folder kept in sync with a workspace branch: pull / push / watch, conflict markers, offline edits |
 | 6. Agent orchestration (planner, path leases, merge queue) | next | parallel sub-agents with serialized, validated merges |
 | 7. MCP server | later | expose the workspace to external agents |
 
@@ -48,7 +49,14 @@ deadlocked a reconfiguration whenever a replica was down) was found and fixed.
   its edits do not overlap anyone else's. In a read-modify-write counter test with 8
   concurrent agents, skipping this check silently loses a large share of the increments; with it, none.
 
-Next: local sync, then agent orchestration (workers, task graph, merge queue).
+**Phase 3 (done)** – local checkouts (`cmws_ws.sync`, `python3 -m cmws_ws.cli`):
+
+- `clone` a workspace branch into a folder, edit it with any tool, `push` / `pull` / `watch`;
+- the same fetch-merge-CAS-retry as agent submission, so a folder and cloud agents can write one branch;
+- conflicts become markers in the files and block pushing until resolved; edits made offline are
+  merged and pushed on reconnect; local renames are detected and followed.
+
+Next: agent orchestration (workers, task graph, merge queue).
 
 (Cross-group multi-key transactions are out of scope; their suite under
 `ShardStorePart2Test` is not expected to pass.)
@@ -62,7 +70,7 @@ make            # compile all modules
 make clean
 python3 run-tests.py -l 5        # this project's own tests (unit, integration, gateway, durability)
 python3 run-tests.py -l 4 -p 2   # sharded store suite (also -l 1 .. -l 3)
-make test-workspace              # workspace engine tests, including runs against the real gateway
+make test-workspace              # workspace engine and sync tests, including runs against the real gateway
 ```
 
 See `NOTICE` for where the test harness comes from.

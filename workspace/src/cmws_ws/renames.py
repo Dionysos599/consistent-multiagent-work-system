@@ -55,14 +55,20 @@ def side_renames(store: ObjectStore, base_commit: Optional[str], side_commit: st
     """{old path: new path} for files that moved between the base and one side of a merge."""
     if base_commit is None:
         return {}
-    base_tree = store.get_commit(base_commit).tree
-    side_tree = store.get_commit(side_commit).tree
+    return moved_between(store, store.get_commit(base_commit).tree,
+                         store.get_commit(side_commit).tree,
+                         recorded_renames(store, base_commit, side_commit))
+
+
+def moved_between(store: ObjectStore, base_tree: str, side_tree: str,
+                  recorded: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Moves between two trees: the recorded ones the trees confirm, then detected ones."""
     changes = changed_files(store, base_tree, side_tree)
     deleted = {p: c.old for p, c in changes.items() if c.kind == DELETED}
     added = {p: c.new for p, c in changes.items() if c.kind == ADDED}
 
     result: Dict[str, str] = {}
-    for src, dst in recorded_renames(store, base_commit, side_commit).items():
+    for src, dst in (recorded or {}).items():
         # trust a record only if the trees agree that the move happened
         if src in deleted and dst in added:
             result[src] = dst

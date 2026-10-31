@@ -46,6 +46,7 @@ class TreeMergeResult:
     conflicts: List[PathConflictInfo] = field(default_factory=list)
     auto_merged: List[str] = field(default_factory=list)  # files merged line by line
     renames_followed: List[Tuple[str, str]] = field(default_factory=list)  # edits carried across
+    keep_going: bool = False
 
     @property
     def clean(self) -> bool:
@@ -55,8 +56,13 @@ class TreeMergeResult:
 def merge_trees(store: ObjectStore, base: Optional[str], ours: str, theirs: str,
                 ours_label: str = "ours", theirs_label: str = "theirs",
                 ours_renames: Optional[Mapping[str, str]] = None,
-                theirs_renames: Optional[Mapping[str, str]] = None) -> TreeMergeResult:
+                theirs_renames: Optional[Mapping[str, str]] = None,
+                keep_going: bool = False) -> TreeMergeResult:
+    """Merge; with ``keep_going`` a tree is produced even when there are conflicts, holding
+    conflict markers for text conflicts and the side that still has the file otherwise, so that
+    a checkout can show the user the merge in progress."""
     result = TreeMergeResult(None)
+    result.keep_going = keep_going
     ours_renames, theirs_renames = ours_renames or {}, theirs_renames or {}
     skip = set()
     for src, dst in ours_renames.items():
@@ -85,8 +91,8 @@ def merge_trees(store: ObjectStore, base: Optional[str], ours: str, theirs: str,
             if moved:
                 result.renames_followed.append((src, dst))
     merged = _merge_dir(store, base, ours, theirs, "", result, ours_label, theirs_label)
-    if result.clean:
-        result.tree = merged
+    if result.clean or keep_going:
+        result.tree = merged if merged is not None else store.empty_tree()
     return result
 
 
@@ -136,8 +142,8 @@ def _merge_dir(store: ObjectStore, base: Optional[str], ours: Optional[str],
         elif _is_file(o) and _is_file(t):
             chosen = _merge_file(store, b if _is_file(b) else None, o, t, path, result, ol, tl)
         else:
-            chosen = None
             result.conflicts.append(_classify(b, o, t, path))
+            chosen = (o or t) if result.keep_going else None   # keep whichever side has the file
         if chosen is not None:
             out[name] = chosen
     if not out:
@@ -165,7 +171,7 @@ def _merge_file(store: ObjectStore, b: Optional[Entry], o: Entry, t: Entry, path
         base_s, ours_s, theirs_s = bb.decode("utf-8"), ob.decode("utf-8"), tb.decode("utf-8")
     except UnicodeDecodeError:
         result.conflicts.append(PathConflictInfo(path, "binary", b.id if b else None, o.id, t.id))
-        return None
+        return o if result.keep_going else None
     merged = merge_text(base_s, ours_s, theirs_s, ours_label=ol, theirs_label=tl)
     if merged.clean:
         result.auto_merged.append(path)
@@ -173,4 +179,6 @@ def _merge_file(store: ObjectStore, b: Optional[Entry], o: Entry, t: Entry, path
     kind = "add-add" if b is None else "content"
     result.conflicts.append(PathConflictInfo(
         path, kind, b.id if b else None, o.id, t.id, tuple(merged.conflicts)))
+    if result.keep_going:
+        return Entry(FILE, store.put_blob(merged.text.encode("utf-8")))   # with markers
     return None
