@@ -17,7 +17,7 @@ The project is built bottom-up:
 | 4. Sharded store with live reconfiguration | done | multiple replica groups, shard migration via a shard master |
 | 5. Versioned workspace (content-addressed objects + CAS refs) | done | fork / commit / three-way merge / stale-read detection on top of the store |
 | 5b. Local sync | done | a real folder kept in sync with a workspace branch: pull / push / watch, conflict markers, offline edits |
-| 6. Agent orchestration (planner, path leases, merge queue) | next | parallel sub-agents with serialized, validated merges |
+| 6. Agent orchestration (workers, planner, path leases, merge queue) | in progress (workers done) | parallel sub-agents with serialized, validated merges |
 | 7. MCP server | later | expose the workspace to external agents |
 
 ## Status
@@ -56,7 +56,15 @@ deadlocked a reconfiguration whenever a replica was down) was found and fixed.
 - conflicts become markers in the files and block pushing until resolved; edits made offline are
   merged and pushed on reconnect; local renames are detected and followed.
 
-Next: agent orchestration (workers, task graph, merge queue).
+**Phase 4A (done)** – workers (`cmws_ws.agents`, `python3 -m cmws_ws.cli run-task`):
+
+- a `Worker` takes a task and a branch forked from main, commits its result to that branch and never touches main;
+- `LoopWorker` is a small tool-calling agent loop over any OpenAI-compatible chat endpoint (a local
+  Ollama by default; no paid service involved) with six file tools and a `finish` call;
+- `CliWorker` checks the branch out into a folder, runs an existing command-line agent there and pushes the result;
+- tested with a scripted model, a fake chat endpoint over HTTP and real subprocesses.
+
+Next: task graph and path leases, then the merge queue.
 
 (Cross-group multi-key transactions are out of scope; their suite under
 `ShardStorePart2Test` is not expected to pass.)

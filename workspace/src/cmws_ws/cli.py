@@ -4,6 +4,8 @@
     python3 -m cmws_ws.cli --url ... clone alice ./alice-work
     python3 -m cmws_ws.cli status ./alice-work        # also: pull, push -m MSG, submit, resolve, watch
     python3 -m cmws_ws.cli --url ... log
+    python3 -m cmws_ws.cli run-task alice "fix the parser" --model qwen3:27b --paths src/parser.py --submit
+    python3 -m cmws_ws.cli run-task bob "add tests" --exec claude -p '{prompt}'     # a command-line agent
 
 The URL defaults to $CMWS_URL, then http://127.0.0.1:8080 (``make run-gateway``).
 """
@@ -38,6 +40,28 @@ def _read_tree(root: Path, checkout_like: Checkout = None):
     return files
 
 
+def _run_task(a, repo: Repository) -> int:
+    from .agents import CliWorker, LoopWorker, OpenAICompatModel, Task, run_task
+    if a.argv:
+        worker = CliWorker(a.argv)
+    elif a.model:
+        worker = LoopWorker(OpenAICompatModel(a.model, a.llm_url), name=a.model, max_steps=a.max_steps)
+    else:
+        print("give --model NAME (served at --llm-url) or --exec COMMAND", file=sys.stderr)
+        return 2
+    result = run_task(worker, repo, Task(a.agent, a.description, tuple(a.paths)), a.agent)
+    print(f"{result.status}: {result.summary or result.error}")
+    print(f"steps={result.steps} tokens={result.prompt_tokens}+{result.completion_tokens} "
+          f"touched={','.join(result.touched) or '-'}")
+    if not result.ok:
+        return 1
+    if a.submit:
+        landed = repo.submit(repo.resume(a.agent), result.summary or None)
+        print(landed.status)
+        return 0 if landed.landed or landed.status == "noop" else 1
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="cmws", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -58,6 +82,15 @@ def main(argv=None) -> int:
             p.add_argument("--debounce", type=float, default=2.0)
     p = sub.add_parser("resolve", help="mark a non-text conflict as handled")
     p.add_argument("dir", type=Path), p.add_argument("path")
+    p = sub.add_parser("run-task", help="run one agent on a task in its own branch")
+    p.add_argument("agent"), p.add_argument("description")
+    p.add_argument("--paths", nargs="*", default=[], help="files or folders the task should stay within")
+    p.add_argument("--model", help="model name served at --llm-url (default worker)")
+    p.add_argument("--llm-url", default=os.environ.get("CMWS_LLM_URL", "http://127.0.0.1:11434/v1"))
+    p.add_argument("--max-steps", type=int, default=30)
+    p.add_argument("--exec", dest="argv", nargs=argparse.REMAINDER,
+                   help="run this command in a checkout instead of the built-in loop; {prompt} is replaced")
+    p.add_argument("--submit", action="store_true", help="land the branch on main afterwards")
     p = sub.add_parser("log", help="history of main")
     p.add_argument("--limit", type=int, default=20)
     a = ap.parse_args(argv)
@@ -74,6 +107,8 @@ def main(argv=None) -> int:
         co = Checkout.clone(repo, a.agent, a.dir)
         print(f"cloned ws/{a.agent} at {co.base[:12]} into {a.dir}")
         return 0
+    if a.cmd == "run-task":
+        return _run_task(a, repo)
     if a.cmd == "log":
         for cid, c in log(repo.store, repo.head(), a.limit):
             print(f"{cid[:12]}  {c.author:12}  {c.message}")
