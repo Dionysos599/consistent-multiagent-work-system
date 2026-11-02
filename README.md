@@ -64,7 +64,17 @@ deadlocked a reconfiguration whenever a replica was down) was found and fixed.
 - `CliWorker` checks the branch out into a folder, runs an existing command-line agent there and pushes the result;
 - tested with a scripted model, a fake chat endpoint over HTTP and real subprocesses.
 
-Next: task graph and path leases, then the merge queue.
+**Phase 4B (done)** – planning and scheduling (`agents.graph`, `agents.planner`, `agents.scheduler`, `leases`):
+
+- a task declares the files it expects to touch; tasks with disjoint scopes run in parallel, overlapping
+  ones run one after another in declaration order and start from a main that already contains the earlier work;
+- path leases are advisory, expiring claims kept in the store under CAS: of racing overlapping claims exactly
+  one is granted, and a crashed agent's lease simply expires;
+- after a task, what it really touched is audited against its declared scope; stray edits and collisions with
+  another live lease are logged;
+- `LLMPlanner` asks a chat model for a JSON task list, validates it and feeds errors back for a retry.
+
+Next: the validating merge queue and the conflict escalation chain.
 
 (Cross-group multi-key transactions are out of scope; their suite under
 `ShardStorePart2Test` is not expected to pass.)

@@ -32,6 +32,7 @@ class Task:
     description: str
     paths: Tuple[str, ...] = ()        # files or folders the task is expected to touch
     context: str = ""                  # extra material the planner chose to hand over
+    depends_on: Tuple[str, ...] = ()   # tasks that must have landed before this one starts
 
 
 @dataclass

@@ -64,11 +64,16 @@ class Toolbox:
         return SPECS
 
     def call(self, name: str, arguments: dict) -> ToolResult:
-        fn = self._tools.get(name)
+        fn = self._tools.get(name) if isinstance(name, str) else None
         if fn is None:
             return ToolResult(f"error: unknown tool {name!r}; available: {', '.join(self._tools)}", False)
+        if not isinstance(arguments, dict):
+            return ToolResult(f"error: the arguments of {name} must be a JSON object", False)
         if "_raw" in arguments:
-            return ToolResult(f"error: the arguments of {name} are not valid JSON: {arguments['_raw'][:200]}", False)
+            return ToolResult(f"error: the arguments of {name} are not valid JSON: {str(arguments['_raw'])[:200]}", False)
+        for key, value in arguments.items():
+            if not isinstance(value, str):
+                return ToolResult(f"error: argument {key!r} of {name} must be a string", False)
         try:
             return fn(**arguments)
         except TypeError as e:

@@ -185,6 +185,53 @@ class GatewayIntegrationTest(unittest.TestCase):
             self.admin("revive", "server1-1")
             self.admin("revive", "server2-2")
 
+    def test_leases_and_a_scheduled_run_on_the_cluster_with_replicas_down(self):
+        from cmws_ws.agents import LoopWorker, Reply, ScriptedModel, Task, TaskGraph, Scheduler
+        from cmws_ws.agents.llm import call
+        from cmws_ws.leases import LeaseTable
+
+        tag = f"{time.time_ns()}"
+        leases = LeaseTable(self.kv(), prefix=f"it-{tag}/", ttl=120)
+        wins = []
+        barrier = threading.Barrier(6)
+
+        def claim(i):
+            barrier.wait()
+            if LeaseTable(self.kv(), prefix=f"it-{tag}/", ttl=120).acquire(f"w{i}", ["shared", f"own{i}"]).granted:
+                wins.append(i)
+        ts = [threading.Thread(target=claim, args=(i,)) for i in range(6)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(wins), 1, "overlapping claims must be serialized by the replicated store")
+        leases.release(f"w{wins[0]}")
+
+        class ByTask:
+            name = "by-task"
+
+            def run(self, task, repo, agent_id):
+                model = ScriptedModel([
+                    Reply("", [call("write_file", "1", path=task.paths[0], content=f"{task.id}\n")]),
+                    Reply("", [call("finish", "2", summary=f"wrote {task.paths[0]}")])])
+                return LoopWorker(model).run(task, repo, agent_id)
+
+        name = f"main-{tag}"
+        repo = Repository.init(self.kv(), {"base.txt": "b\n"}, main=name)
+        ids = [f"s{tag}-{i}" for i in range(5)]
+        tasks = [Task(i, f"write {i}", (f"out/{i}.txt",)) for i in ids]
+        self.admin("kill", "server1-1")
+        self.admin("kill", "server2-2")
+        try:
+            rep = Scheduler(repo, leases, ByTask(), parallel=3, poll=0.01).run(TaskGraph(tasks))
+            self.assertTrue(rep.ok, {k: v.reason for k, v in rep.outcomes.items()})
+            fresh = Repository(self.kv(), main=name)
+            files = fresh.main_files()
+            for i in ids:
+                self.assertEqual(files[f"out/{i}.txt"], f"{i}\n".encode())
+            self.assertEqual(leases.holders(), {})
+        finally:
+            self.admin("revive", "server1-1")
+            self.admin("revive", "server2-2")
+
 
 if __name__ == "__main__":
     unittest.main()

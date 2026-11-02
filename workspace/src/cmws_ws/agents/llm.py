@@ -56,18 +56,20 @@ def _arguments(raw) -> dict:
 
 
 def parse_reply(body: dict) -> Reply:
+    """Turn a chat-completions response into a Reply; anything malformed is a ModelError."""
     try:
         message = body["choices"][0]["message"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise ModelError(f"unexpected response: {str(body)[:200]}") from e
-    calls = []
-    for i, c in enumerate(message.get("tool_calls") or []):
-        fn = c.get("function") or {}
-        calls.append(ToolCall(c.get("id") or f"call_{i}", fn.get("name", ""),
-                              _arguments(fn.get("arguments"))))
-    usage = body.get("usage") or {}
-    return Reply(message.get("content") or "", tuple(calls),
-                 Usage(int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)))
+        calls = []
+        for i, c in enumerate(message.get("tool_calls") or []):
+            fn = c.get("function") or {}
+            calls.append(ToolCall(str(c.get("id") or f"call_{i}"), str(fn.get("name") or ""),
+                                  _arguments(fn.get("arguments"))))
+        usage = body.get("usage") or {}
+        content = message.get("content")
+        return Reply("" if content is None else str(content), tuple(calls),
+                     Usage(int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)))
+    except (KeyError, IndexError, TypeError, AttributeError, ValueError) as e:
+        raise ModelError(f"unexpected response ({type(e).__name__}): {str(body)[:200]}") from e
 
 
 class OpenAICompatModel:
