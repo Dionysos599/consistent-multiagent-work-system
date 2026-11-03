@@ -232,6 +232,37 @@ class GatewayIntegrationTest(unittest.TestCase):
             self.admin("revive", "server1-1")
             self.admin("revive", "server2-2")
 
+    def test_merge_queue_on_the_cluster_resolves_a_conflict_and_gates_main_with_a_real_command(self):
+        from cmws_ws.agents import CommandValidator, Escalations, MergeQueue, Reply, ScriptedModel, Task, merger_worker
+        from cmws_ws.agents.llm import call
+
+        tag = f"{time.time_ns()}"
+        name = f"main-{tag}"
+        pad = lambda *xs: "".join(f"{x}\n" for x in xs)
+        base = pad("A = 1", "# p1", "# p2", "# p3", "B = 2", "# p4", "# p5", "# p6", "C = 3")
+        repo = Repository.init(self.kv(), {"cfg.py": base, "check.py": "import cfg\nassert cfg.A < cfg.C\n"}, main=name)
+        edits = {"one": pad("A = 10", "# p1", "# p2", "# p3", "B = 2", "# p4", "# p5", "# p6", "C = 30"),
+                 "two": pad("A = 1", "# p1", "# p2", "D = 4", "# p3", "B = 2", "# p4", "# p5", "# p6", "C = 3"),
+                 "three": pad("A = 1", "# p1", "# p2", "# p3", "B = 20", "# p4", "# p5", "# p6", "C = 31")}
+        for who, text in edits.items():
+            ws = repo.fork(f"{who}-{tag}")
+            ws.write("cfg.py", text)
+            ws.commit(who)
+        resolved = pad("A = 10", "# p1", "# p2", "D = 4", "# p3", "B = 20", "# p4", "# p5", "# p6", "C = 30")
+        merger = merger_worker(ScriptedModel([
+            Reply("", [call("write_file", "1", path="cfg.py", content=resolved)]),
+            Reply("", [call("finish", "2", summary="kept both")])]))
+        q = MergeQueue(repo, CommandValidator([sys.executable, "check.py"]), merger=merger,
+                       escalations=Escalations(self.kv(), prefix=f"it-{tag}/"))
+        self.assertTrue(q.land(Task(f"one-{tag}", "x")).landed)             # A=10, C=30
+        two = q.land(Task(f"two-{tag}", "x"))                              # adds D: merges cleanly
+        self.assertEqual((two.landed, two.via), (True, "auto"), two.steps)
+        three = q.land(Task(f"three-{tag}", "x"))                          # B=20 next to D=4: conflicts
+        self.assertTrue(three.landed, three.steps)
+        final = Repository(self.kv(), main=name).main_files()["cfg.py"].decode()
+        self.assertEqual(final, resolved)
+        self.assertEqual(three.via, "merger")
+
 
 if __name__ == "__main__":
     unittest.main()

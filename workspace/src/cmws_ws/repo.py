@@ -42,12 +42,13 @@ class NoSuchWorkspace(Exception):
 
 @dataclass
 class SubmitResult:
-    status: str  # 'fast-forward' | 'merged' | 'noop' | 'conflict' | 'stale' | 'contended'
+    status: str  # 'fast-forward' | 'merged' | 'noop' | 'conflict' | 'stale' | 'rejected' | 'contended'
     commit: Optional[str] = None  # the new main, when the work landed
     conflicts: List[PathConflictInfo] = field(default_factory=list)
     stale_reads: List[StaleRead] = field(default_factory=list)
     auto_merged: List[str] = field(default_factory=list)
     attempts: int = 0
+    detail: str = ""  # why a 'rejected' landing was refused (the validator's output)
 
     @property
     def landed(self) -> bool:
@@ -157,25 +158,31 @@ class Repository:
     # ---- merging -------------------------------------------------------------------------
 
     def merge_into(self, ours: str, theirs: str, ours_label: str = "ours",
-                   theirs_label: str = "theirs") -> TreeMergeResult:
+                   theirs_label: str = "theirs", keep_going: bool = False) -> TreeMergeResult:
         """Three-way merge of two commits' trees around their merge base."""
         base = merge_base(self.store, ours, theirs)
         base_tree = self.store.get_commit(base).tree if base else None
         return merge_trees(self.store, base_tree, self.store.get_commit(ours).tree,
                            self.store.get_commit(theirs).tree, ours_label, theirs_label,
                            ours_renames=side_renames(self.store, base, ours),
-                           theirs_renames=side_renames(self.store, base, theirs))
+                           theirs_renames=side_renames(self.store, base, theirs),
+                           keep_going=keep_going)
 
     # ---- submit --------------------------------------------------------------------------
 
     def submit(self, ws: Workspace, message: Optional[str] = None,
-               allow_stale: bool = False) -> SubmitResult:
+               allow_stale: bool = False,
+               validate: Optional[Callable[[str], Optional[str]]] = None) -> SubmitResult:
         """Land the workspace's work on main.
 
         Uncommitted edits are committed first (``message``). Returns ``stale`` or ``conflict``
         without touching main when the work cannot land as it stands; the caller (an
         orchestrator) then decides whether to sync and redo, merge by hand, or give up.
         With ``allow_stale`` the stale reads are reported but do not block the merge.
+        ``validate`` is called with the commit that would become main, after merging and before
+        the compare-and-set; it returns None to accept or a message to refuse (status 'rejected',
+        main untouched). It runs again if main moves and the merge has to be redone, so whatever
+        it approved is exactly what lands.
         """
         if ws.dirty:
             ws.commit(message or f"Work by {ws.agent_id}")
@@ -205,6 +212,11 @@ class Repository:
                     merged.tree, (main, ws.head), ws.agent_id,
                     f"Merge {ws.ref_name}" + (f": {message}" if message else ""), self.clock()))
                 status, merged_files = "merged", merged.auto_merged
+            if validate is not None:
+                problem = validate(new_main)
+                if problem is not None:
+                    result.status, result.detail = "rejected", problem
+                    return result
             if self.refs.cas(self.main, main, new_main).ok:
                 result.status, result.commit = status, new_main
                 result.auto_merged = merged_files

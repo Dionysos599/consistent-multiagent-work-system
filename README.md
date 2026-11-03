@@ -17,7 +17,7 @@ The project is built bottom-up:
 | 4. Sharded store with live reconfiguration | done | multiple replica groups, shard migration via a shard master |
 | 5. Versioned workspace (content-addressed objects + CAS refs) | done | fork / commit / three-way merge / stale-read detection on top of the store |
 | 5b. Local sync | done | a real folder kept in sync with a workspace branch: pull / push / watch, conflict markers, offline edits |
-| 6. Agent orchestration (workers, planner, path leases, merge queue) | in progress (workers done) | parallel sub-agents with serialized, validated merges |
+| 6. Agent orchestration (workers, planner, path leases, merge queue) | in progress (workers, scheduling, merge queue done) | parallel sub-agents with serialized, validated merges |
 | 7. MCP server | later | expose the workspace to external agents |
 
 ## Status
@@ -74,7 +74,16 @@ deadlocked a reconfiguration whenever a replica was down) was found and fixed.
   another live lease are logged;
 - `LLMPlanner` asks a chat model for a JSON task list, validates it and feeds errors back for a retry.
 
-Next: the validating merge queue and the conflict escalation chain.
+**Phase 4C (done)** – the merge queue (`agents.mergequeue`):
+
+- finished branches land one at a time through a queue that validates the *merged* result (for example by
+  running the test suite on it) before main moves, so main only ever holds approved states;
+- a branch that cannot land escalates: automatic three-way merge, then a merger agent that sees both sides'
+  intent and the conflict markers, then a redo of the task on top of what landed, then a durable record for a person;
+- tested with semantic conflicts that text merge accepts, concurrent landings checked against the recorded
+  history of main, random edit storms through every stage, and a run on the real cluster.
+
+Next: reliability (call de-duplication, checkpoints, crash recovery) and the end-to-end orchestrator.
 
 (Cross-group multi-key transactions are out of scope; their suite under
 `ShardStorePart2Test` is not expected to pass.)

@@ -4,6 +4,7 @@
     python3 -m cmws_ws.cli --url ... clone alice ./alice-work
     python3 -m cmws_ws.cli status ./alice-work        # also: pull, push -m MSG, submit, resolve, watch
     python3 -m cmws_ws.cli --url ... log
+    python3 -m cmws_ws.cli --url ... escalations         # work the merge queue left for a person
     python3 -m cmws_ws.cli run-task alice "fix the parser" --model qwen3:27b --paths src/parser.py --submit
     python3 -m cmws_ws.cli run-task bob "add tests" --exec claude -p '{prompt}'     # a command-line agent
 
@@ -38,6 +39,15 @@ def _read_tree(root: Path, checkout_like: Checkout = None):
             if not ignore.ignored(rel) and p.is_file() and not p.is_symlink():
                 files[rel] = p.read_bytes()
     return files
+
+
+def _print_escalations(items) -> int:
+    for e in items:
+        print(f"{e['id']}  {e['branch']}  {e['reason']}  {e['detail']}")
+        for stage, status, detail in e.get("steps", []):
+            print(f"    {stage:7} {status:14} {detail}")
+    print(f"{len(items)} escalation(s)")
+    return 0
 
 
 def _run_task(a, repo: Repository) -> int:
@@ -91,6 +101,7 @@ def main(argv=None) -> int:
     p.add_argument("--exec", dest="argv", nargs=argparse.REMAINDER,
                    help="run this command in a checkout instead of the built-in loop; {prompt} is replaced")
     p.add_argument("--submit", action="store_true", help="land the branch on main afterwards")
+    sub.add_parser("escalations", help="work the merge queue could not land and left for a person")
     p = sub.add_parser("log", help="history of main")
     p.add_argument("--limit", type=int, default=20)
     a = ap.parse_args(argv)
@@ -109,6 +120,9 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "run-task":
         return _run_task(a, repo)
+    if a.cmd == "escalations":
+        from .agents import Escalations
+        return _print_escalations(Escalations(kv).list())
     if a.cmd == "log":
         for cid, c in log(repo.store, repo.head(), a.limit):
             print(f"{cid[:12]}  {c.author:12}  {c.message}")
