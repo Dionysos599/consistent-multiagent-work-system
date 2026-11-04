@@ -6,6 +6,8 @@
     python3 -m cmws_ws.cli --url ... log
     python3 -m cmws_ws.cli --url ... escalations         # work the merge queue left for a person
     python3 -m cmws_ws.cli run-task alice "fix the parser" --model qwen3:27b --paths src/parser.py --submit
+    python3 -m cmws_ws.cli orchestrate r1 --goal "add a CLI flag" --model qwen3:27b --validate-cmd "python3 -m unittest"
+    python3 -m cmws_ws.cli run-status r1                 # plan, claims and result of a run (also how to resume it)
     python3 -m cmws_ws.cli run-task bob "add tests" --exec claude -p '{prompt}'     # a command-line agent
 
 The URL defaults to $CMWS_URL, then http://127.0.0.1:8080 (``make run-gateway``).
@@ -14,6 +16,7 @@ The URL defaults to $CMWS_URL, then http://127.0.0.1:8080 (``make run-gateway``)
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -72,6 +75,39 @@ def _run_task(a, repo: Repository) -> int:
     return 0
 
 
+def _orchestrate(a, repo: Repository) -> int:
+    import json
+    import shlex
+    from .agents import (CliWorker, CommandValidator, LLMPlanner, LoopWorker, MergeQueue, OpenAICompatModel,
+                         Orchestrator, StaticPlanner, TaskGraph)
+    from .agents.orchestrator import task_from_dict
+    if a.argv:
+        worker = CliWorker(a.argv)
+    elif a.model:
+        worker = LoopWorker(OpenAICompatModel(a.model, a.llm_url), name=a.model, max_steps=a.max_steps,
+                            checkpoint_every=a.checkpoint_every)
+    else:
+        print("give --model NAME (served at --llm-url) or --exec COMMAND", file=sys.stderr)
+        return 2
+    graph, planner = None, None
+    if a.tasks:
+        graph = TaskGraph([task_from_dict(d) for d in json.loads(a.tasks.read_text())])
+    elif a.model:
+        planner = LLMPlanner(OpenAICompatModel(a.model, a.llm_url))
+    validator = CommandValidator(shlex.split(a.validate_cmd)) if a.validate_cmd else None
+    queue = MergeQueue(repo, validator=validator)
+    orch = Orchestrator(repo, worker, planner=planner, queue=queue, owner=a.owner, parallel=a.parallel)
+    try:
+        summary = orch.run(a.run_id, goal=a.goal, graph=graph)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    print(f"run {summary.run_id} ({'resumed' if summary.resumed else 'planned'} by {orch.owner}): main = {summary.main[:12]}")
+    for tid, o in summary.report.outcomes.items():
+        print(f"  {tid:20} {o.status:9} {o.reason}")
+    return 0 if summary.ok else 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="cmws", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -101,6 +137,19 @@ def main(argv=None) -> int:
     p.add_argument("--exec", dest="argv", nargs=argparse.REMAINDER,
                    help="run this command in a checkout instead of the built-in loop; {prompt} is replaced")
     p.add_argument("--submit", action="store_true", help="land the branch on main afterwards")
+    p = sub.add_parser("orchestrate", help="plan a goal, run the tasks in parallel and land them (resumable by run id)")
+    p.add_argument("run_id")
+    p.add_argument("--goal", help="what to build; split into tasks by the model")
+    p.add_argument("--tasks", type=Path, help="JSON file with the task list instead of a goal")
+    p.add_argument("--model"), p.add_argument("--llm-url", default=os.environ.get("CMWS_LLM_URL", "http://127.0.0.1:11434/v1"))
+    p.add_argument("--exec", dest="argv", nargs=argparse.REMAINDER, help="use a command-line agent for every task")
+    p.add_argument("--validate-cmd", help="command run on the merged tree before main moves (exit 0 = accept)")
+    p.add_argument("--parallel", type=int, default=4)
+    p.add_argument("--max-steps", type=int, default=30)
+    p.add_argument("--checkpoint-every", type=int, default=3, help="tool calls between checkpoints of a task")
+    p.add_argument("--owner", help="name of this orchestrator (default: host and random suffix)")
+    p = sub.add_parser("run-status", help="plan, claims and result of a run")
+    p.add_argument("run_id")
     sub.add_parser("escalations", help="work the merge queue could not land and left for a person")
     p = sub.add_parser("log", help="history of main")
     p.add_argument("--limit", type=int, default=20)
@@ -120,6 +169,22 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "run-task":
         return _run_task(a, repo)
+    if a.cmd == "orchestrate":
+        return _orchestrate(a, repo)
+    if a.cmd == "run-status":
+        from .agents import run_status
+        st = run_status(kv, a.run_id)
+        if st["plan"] is None:
+            print("no such run")
+            return 1
+        print("goal:", st["plan"]["goal"])
+        for t in st["plan"]["tasks"]:
+            c = st["claims"].get(t["id"], {})
+            state = c.get("outcome", {}).get("status", c.get("state", "pending")) if c else "pending"
+            print(f"  {t['id']:20} {state:10} {c.get('owner', '')}")
+        if st["result"]:
+            print("result:", json.dumps(st["result"], sort_keys=True))
+        return 0
     if a.cmd == "escalations":
         from .agents import Escalations
         return _print_escalations(Escalations(kv).list())

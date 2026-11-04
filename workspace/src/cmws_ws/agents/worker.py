@@ -21,6 +21,7 @@ from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 from ..repo import NoSuchWorkspace, Repository
 from ..sync import Checkout
 from .llm import ChatModel, ModelError
+from .session import Session
 from .tools import Toolbox
 
 DONE, GAVE_UP, STEP_LIMIT, ERROR = "done", "gave_up", "step_limit", "error"
@@ -88,19 +89,41 @@ project at the same time, so stay inside the area you were given."""
 
 
 class LoopWorker:
+    """A tool-calling loop over a chat model.
+
+    With ``checkpoint_every`` (a number of tool calls) the run becomes durable: tool calls are numbered
+    and executed once, the branch is committed and the conversation recorded every that many calls, and
+    running the same task again after a crash picks up from the last record instead of starting over.
+    """
+
     def __init__(self, model: ChatModel, name: str = "loop", max_steps: int = 30, max_nudges: int = 2,
-                 system: str = SYSTEM) -> None:
+                 system: str = SYSTEM, checkpoint_every: Optional[int] = None) -> None:
         self.model, self.name = model, name
         self.max_steps, self.max_nudges, self.system = max_steps, max_nudges, system
+        self.checkpoint_every = checkpoint_every
 
     def run(self, task: Task, repo: Repository, agent_id: str) -> WorkerResult:
-        ws = repo.resume(agent_id)
-        tools = Toolbox(ws)
+        session = Session.open(repo, agent_id) if self.checkpoint_every else None
+        if session is not None and session.done is not None:
+            d = dict(session.done)                            # finished before the crash: nothing to redo
+            d["touched"] = tuple(d["touched"])
+            return WorkerResult(**d)
+        if session is not None:
+            ws, tools = session.ws, session.tools
+        else:
+            ws = repo.resume(agent_id)
+            tools = Toolbox(ws)
         messages: List[dict] = [{"role": "system", "content": self.system},
                                 {"role": "user", "content": task_prompt(task)}]
         result = WorkerResult(GAVE_UP)
-        nudges = 0
-        for step in range(1, self.max_steps + 1):
+        nudges, first = 0, 1
+        saved = session.state if session is not None else None
+        if saved:
+            messages, nudges, first = saved["messages"], saved["nudges"], saved["step"] + 1
+            result.prompt_tokens, result.completion_tokens = saved["prompt_tokens"], saved["completion_tokens"]
+            tools.written.update(saved["written"])
+        result.steps = first - 1
+        for step in range(first, self.max_steps + 1):
             try:
                 reply = self.model.chat(messages, tools.specs())
             except ModelError as e:
@@ -127,20 +150,40 @@ class LoopWorker:
             nudges = 0
             finished = False
             for c in reply.tool_calls:
-                out = tools.call(c.name, c.arguments)
+                out = session.call(session.next_seq(), c.name, c.arguments) if session else tools.call(c.name, c.arguments)
                 messages.append({"role": "tool", "tool_call_id": c.id, "content": out.text})
                 if out.finished:
                     finished, result.summary = True, out.text
             if finished:
                 result.status = DONE
                 break
+            if session is not None and session.since_checkpoint >= self.checkpoint_every:
+                session.checkpoint(self._state(messages, nudges, step, result, tools))
         else:
             result.status = STEP_LIMIT
         result.touched = tuple(sorted(tools.written))
         result.transcript = messages
+        message = f"{task.id}: {_first_line(result.summary) or task.description[:60]}"
         if result.status == DONE:
-            result.commit = ws.commit(f"{task.id}: {_first_line(result.summary) or task.description[:60]}")
+            result.commit = ws.commit(message)
+            if session is not None:
+                result.commit = result.commit or (ws.head if ws.head != ws.fork_base else None)
+                session.checkpoint(self._state(messages, nudges, result.steps, result, tools),
+                                   done=_record(result), message=message)
+        elif session is not None:
+            session.checkpoint(self._state(messages, nudges, result.steps, result, tools))
         return result
+
+    @staticmethod
+    def _state(messages, nudges, step, result, tools) -> dict:
+        return {"messages": messages, "nudges": nudges, "step": step, "written": sorted(tools.written),
+                "prompt_tokens": result.prompt_tokens, "completion_tokens": result.completion_tokens}
+
+
+def _record(r: WorkerResult) -> dict:
+    return {"status": r.status, "summary": r.summary, "commit": r.commit, "touched": list(r.touched),
+            "steps": r.steps, "prompt_tokens": r.prompt_tokens, "completion_tokens": r.completion_tokens,
+            "error": r.error}
 
 
 def _dump(arguments: dict) -> str:

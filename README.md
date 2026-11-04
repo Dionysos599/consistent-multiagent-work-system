@@ -17,7 +17,7 @@ The project is built bottom-up:
 | 4. Sharded store with live reconfiguration | done | multiple replica groups, shard migration via a shard master |
 | 5. Versioned workspace (content-addressed objects + CAS refs) | done | fork / commit / three-way merge / stale-read detection on top of the store |
 | 5b. Local sync | done | a real folder kept in sync with a workspace branch: pull / push / watch, conflict markers, offline edits |
-| 6. Agent orchestration (workers, planner, path leases, merge queue) | in progress (workers, scheduling, merge queue done) | parallel sub-agents with serialized, validated merges |
+| 6. Agent orchestration (workers, planner, path leases, merge queue, crash recovery) | done | parallel sub-agents with serialized, validated merges that survive crashes |
 | 7. MCP server | later | expose the workspace to external agents |
 
 ## Status
@@ -83,7 +83,20 @@ deadlocked a reconfiguration whenever a replica was down) was found and fixed.
 - tested with semantic conflicts that text merge accepts, concurrent landings checked against the recorded
   history of main, random edit storms through every stage, and a run on the real cluster.
 
-Next: reliability (call de-duplication, checkpoints, crash recovery) and the end-to-end orchestrator.
+**Phase 4D (done)** – reliability and the end-to-end orchestrator (`agents.session`, `claims`, `agents.orchestrator`):
+
+- tool calls carry sequence numbers and run at most once; a retried call gets the recorded answer, so an agent
+  reached over an unreliable link never edits a file twice;
+- a worker checkpoints (commit plus conversation) every few calls; after a crash it resumes from the last
+  checkpoint with the branch put back in line with it, instead of starting over;
+- tasks are claimed with an expiring, fenced claim: one live owner per task, takeover after a crash, and a
+  replaced owner cannot land or complete;
+- `Orchestrator.run(run_id, goal)` plans once (the plan is stored), schedules, lands through the merge queue and can
+  be run again with the same id after a crash: finished tasks are not repeated; `cli orchestrate` / `cli run-status`;
+- tested with a model that "dies" mid-run, a second orchestrator that must not steal a live claim, two orchestrators
+  on one run, and a real process killed with `os._exit` against the real cluster.
+
+Next: evaluation (does orchestration beat a single agent, and what do the merge strategies cost) and an MCP server.
 
 (Cross-group multi-key transactions are out of scope; their suite under
 `ShardStorePart2Test` is not expected to pass.)

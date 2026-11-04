@@ -232,6 +232,29 @@ class GatewayIntegrationTest(unittest.TestCase):
             self.admin("revive", "server1-1")
             self.admin("revive", "server2-2")
 
+    def test_an_orchestrator_killed_mid_task_is_taken_over_and_finishes_the_run(self):
+        tag = f"{time.time_ns()}"
+        name, run_id = f"main-{tag}", f"run-{tag}"
+        repo = Repository.init(self.kv(), {"base.txt": "b\n"}, main=name)
+        runner = os.path.join(os.path.dirname(__file__), "crash_runner.py")
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join([SRC, ROOT]))
+        args = [sys.executable, runner, self.base, name, run_id, tag]
+        first = subprocess.run(args + ["crash"], env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(first.returncode, 9, first.stderr[-500:])      # the process died inside task x
+        self.assertEqual(repo.main_files(), {"base.txt": b"b\n"})       # nothing had landed
+        import json
+        doc = json.loads(self.kv().get(f"session/x{tag}"))
+        self.assertEqual(doc["seq"], 3)                                  # its three writes were checkpointed
+        second = subprocess.run(args + ["finish"], env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual((second.returncode, second.stdout.strip()), (0, "ok"), second.stderr[-500:])
+        files = Repository(self.kv(), main=name).main_files()
+        for t in (f"x{tag}", f"y{tag}"):
+            for i in range(3):
+                self.assertEqual(files[f"out/{t}/f{i}.txt"], f"{t} {i}\n".encode())
+        claims = json.loads(self.kv().get(f"runs/{run_id}/claims"))
+        self.assertEqual((claims[f"x{tag}"]["epoch"], claims[f"x{tag}"]["state"]), (2, "completed"))
+        self.assertEqual(claims[f"y{tag}"]["epoch"], 1)
+
     def test_merge_queue_on_the_cluster_resolves_a_conflict_and_gates_main_with_a_real_command(self):
         from cmws_ws.agents import CommandValidator, Escalations, MergeQueue, Reply, ScriptedModel, Task, merger_worker
         from cmws_ws.agents.llm import call

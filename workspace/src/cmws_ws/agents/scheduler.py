@@ -15,6 +15,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Set
 
+from ..claims import BUSY, COMPLETED, TaskClaims
 from ..leases import Audit, LeaseTable
 from ..repo import Repository, SubmitResult
 from .graph import TaskGraph
@@ -59,10 +60,16 @@ class Scheduler:
     def __init__(self, repo: Repository, leases: LeaseTable, worker: Worker, parallel: int = 4,
                  land: Land = land_directly, lease_ttl: Optional[float] = None, poll: float = 0.05,
                  patience: float = 60.0, sleep: Callable[[float], None] = time.sleep,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic, claims: Optional[TaskClaims] = None,
+                 owner: str = "scheduler", claim_ttl: Optional[float] = None,
+                 heartbeat: Optional[float] = None) -> None:
         self.repo, self.leases, self.worker, self.parallel = repo, leases, worker, parallel
         self.land, self.lease_ttl, self.poll, self.patience = land, lease_ttl, poll, patience
         self._sleep, self._clock = sleep, clock
+        self._last_beat = clock()
+        self.claims, self.owner, self.claim_ttl = claims, owner, claim_ttl
+        ttl = claim_ttl if claim_ttl is not None else (claims.ttl if claims is not None else 0)
+        self.heartbeat = heartbeat if heartbeat is not None else (ttl / 3 if claims is not None else None)
 
     def run(self, graph: TaskGraph) -> RunReport:
         report = RunReport()
@@ -72,6 +79,8 @@ class Scheduler:
         running: Dict[Future, Task] = {}
         gauge = threading.Lock()
         live = [0]
+        epochs: Dict[str, int] = {}             # task -> epoch of the claim we hold on it
+        lost: Set[str] = set()                  # tasks whose claim another owner has taken over
 
         def work(task: Task) -> Outcome:
             out = Outcome(task, FAILED, started=self._clock())
@@ -84,20 +93,29 @@ class Scheduler:
                 out.audit = self.leases.audit(task.id, result.touched, task.paths)
                 if not result.ok:
                     out.reason = result.error or result.status
-                    return out
-                landed = self.land(self.repo, task, result)
-                out.landed = landed
-                if landed is None or landed.landed or landed.status == "noop":
-                    out.status = DONE
+                elif task.id in lost:
+                    out.reason = "claim lost to another owner"
                 else:
-                    out.status, out.reason = REJECTED, landed.status
+                    landed = self.land(self.repo, task, result)
+                    out.landed = landed
+                    if landed is None or landed.landed or landed.status == "noop":
+                        out.status = DONE
+                    else:
+                        out.status, out.reason = REJECTED, landed.status
             except Exception as e:                               # a bug in a worker must not stall the run
                 out.reason = f"{type(e).__name__}: {e}"
             finally:
                 with gauge:
                     live[0] -= 1
+            # Not in a finally clause on purpose: a process that dies here leaves its claim and lease
+            # behind, to expire, exactly as a crash would.
+            out.finished = self._clock()
+            if self.claims is not None and task.id not in lost:
+                self.claims.complete(task.id, self.owner, epochs[task.id], {
+                    "status": out.status, "reason": out.reason,
+                    "commit": out.landed.commit if out.landed is not None else None})
+            if task.id not in lost:
                 self.leases.release(task.id)
-                out.finished = self._clock()
             return out
 
         with ThreadPoolExecutor(max_workers=self.parallel) as pool:
@@ -109,11 +127,22 @@ class Scheduler:
                 for task in graph.ready(finished, started):
                     if len(running) >= self.parallel:
                         break
+                    if self.claims is not None:
+                        claim = self.claims.claim(task.id, self.owner, self.claim_ttl)
+                        if claim.status == COMPLETED:               # an earlier run already finished it
+                            self._adopt(task, claim.outcome, report, finished, landed_ok)
+                            continue
+                        if claim.status == BUSY:
+                            continue                                # another owner is running it
+                        epochs[task.id] = claim.epoch
                     got = self.leases.acquire(task.id, task.paths, self.lease_ttl)
                     if not got.granted:
+                        if self.claims is not None:
+                            self.claims.release(task.id, self.owner, epochs[task.id])
                         continue                                  # someone outside this run holds the files
                     started.add(task.id)
                     running[pool.submit(work, task)] = task
+                self._beat(running, epochs, lost)
                 if running:
                     idle_since = None
                     done, _ = wait(list(running), timeout=self.poll, return_when=FIRST_COMPLETED)
@@ -134,6 +163,30 @@ class Scheduler:
                         break
                     self._sleep(self.poll)
         return report
+
+    def _adopt(self, task: Task, outcome: dict, report: RunReport, finished: Set[str], landed_ok: Set[str]) -> None:
+        status = outcome.get("status", FAILED)
+        report.outcomes[task.id] = Outcome(task, status, reason=outcome.get("reason", "") or "completed earlier")
+        finished.add(task.id)
+        if status == DONE:
+            landed_ok.add(task.id)
+
+    def _beat(self, running: Dict[Future, Task], epochs: Dict[str, int], lost: Set[str]) -> None:
+        """Keep the claims and leases of running tasks alive; note the claims that were taken over."""
+        if self.claims is None or self.heartbeat is None:
+            return
+        now = self._clock()
+        if now - self._last_beat < self.heartbeat:
+            return
+        self._last_beat = now
+        for task in list(running.values()):
+            if task.id in lost:
+                continue
+            if not self.claims.renew(task.id, self.owner, epochs[task.id], self.claim_ttl):
+                lost.add(task.id)
+                continue
+            if not self.leases.renew(task.id, self.lease_ttl):
+                self.leases.acquire(task.id, task.paths, self.lease_ttl)   # it ran out meanwhile
 
     @staticmethod
     def _skip_dead(graph: TaskGraph, finished: Set[str], landed_ok: Set[str], report: RunReport) -> None:
