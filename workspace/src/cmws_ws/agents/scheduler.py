@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Set
 from ..claims import BUSY, COMPLETED, TaskClaims
 from ..leases import Audit, LeaseTable
 from ..repo import Repository, SubmitResult
+from . import fence
 from .graph import TaskGraph
 from .worker import Task, Worker, WorkerResult, run_task
 
@@ -28,7 +29,8 @@ Land = Callable[[Repository, Task, WorkerResult], Optional[SubmitResult]]
 
 def land_directly(repo: Repository, task: Task, result: WorkerResult) -> Optional[SubmitResult]:
     ws = repo.resume(task.id)
-    return repo.submit(ws, f"{task.id}: {result.summary.strip().splitlines()[0][:80] if result.summary.strip() else task.description[:60]}")
+    return repo.submit(ws, f"{task.id}: {result.summary.strip().splitlines()[0][:80] if result.summary.strip() else task.description[:60]}",
+                       validate=lambda candidate: fence.check())
 
 
 @dataclass
@@ -94,12 +96,21 @@ class Scheduler:
                 if not result.ok:
                     out.reason = result.error or result.status
                 elif task.id in lost:
-                    out.reason = "claim lost to another owner"
+                    out.reason = fence.LOST
                 else:
-                    landed = self.land(self.repo, task, result)
+                    if self.claims is not None:
+                        epoch = epochs[task.id]
+                        guard = lambda: None if self.claims.holds(task.id, self.owner, epoch) else fence.LOST  # noqa: E731
+                    else:
+                        guard = lambda: None  # noqa: E731
+                    with fence.fenced(guard):
+                        landed = self.land(self.repo, task, result)
                     out.landed = landed
                     if landed is None or landed.landed or landed.status == "noop":
                         out.status = DONE
+                    elif getattr(landed, "detail", "") == fence.LOST:
+                        out.status, out.reason = FAILED, fence.LOST
+                        lost.add(task.id)
                     else:
                         out.status, out.reason = REJECTED, landed.status
             except Exception as e:                               # a bug in a worker must not stall the run

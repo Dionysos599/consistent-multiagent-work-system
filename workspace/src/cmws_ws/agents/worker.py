@@ -200,34 +200,78 @@ class CliWorker:
 
     ``argv`` is the command; any element containing ``{prompt}`` gets the task text substituted
     (``["claude", "-p", "{prompt}"]``). With no placeholder the prompt is written to stdin. A
-    non-zero exit leaves the branch untouched.
+    non-zero exit leaves the branch as the last checkpoint left it.
+
+    With ``checkpoint_every`` (seconds) whatever the command has written so far is pushed to the branch at
+    that interval. If the machine dies, the next attempt starts from those files and is told what the
+    branch already contains, instead of starting over.
     """
 
     def __init__(self, argv: Sequence[str], name: str = "cli", timeout: float = 1800.0,
-                 env: Optional[Dict[str, str]] = None, keep_dir: Optional[Path] = None) -> None:
+                 env: Optional[Dict[str, str]] = None, keep_dir: Optional[Path] = None,
+                 checkpoint_every: Optional[float] = None) -> None:
         self.argv, self.name, self.timeout, self.env, self.keep_dir = list(argv), name, timeout, env, keep_dir
+        self.checkpoint_every = checkpoint_every
 
     def run(self, task: Task, repo: Repository, agent_id: str) -> WorkerResult:
+        prior = _prior_work(repo, agent_id)
         prompt = task_prompt(task)
+        if prior:
+            prompt += ("\n\nAn earlier attempt at this task already changed these files on your branch: "
+                       + ", ".join(prior) + ". They are in your working folder. Continue from there; "
+                       "do not start over, and finish whatever is missing.")
         with tempfile.TemporaryDirectory(prefix="cmws-cli-") as tmp:
             root = Path(self.keep_dir) if self.keep_dir else Path(tmp) / "work"
             co = Checkout.clone(repo, agent_id, root)
             argv = [a.replace("{prompt}", prompt) for a in self.argv]
             stdin = None if any("{prompt}" in a for a in self.argv) else prompt
             try:
-                proc = subprocess.run(argv, cwd=root, input=stdin, capture_output=True, text=True,
-                                      timeout=self.timeout, env=self.env)
+                proc = self._execute(argv, root, stdin, co, task)
             except subprocess.TimeoutExpired:
                 return WorkerResult(ERROR, error=f"timed out after {self.timeout:.0f}s")
             except OSError as e:
                 return WorkerResult(ERROR, error=f"cannot run {argv[0]}: {e}")
             tail = (proc.stdout or "").strip()[-2000:]
             if proc.returncode != 0:
-                return WorkerResult(ERROR, summary=tail, error=f"exit status {proc.returncode}: "
-                                    + (proc.stderr or "").strip()[-500:])
-            touched = tuple(sorted(co.status()))
+                detail = (proc.stderr or "").strip()[-500:] or tail[-500:]     # some agents report errors on stdout
+                return WorkerResult(ERROR, summary=tail, error=f"exit status {proc.returncode}: {detail}")
+            pushed_before = {c.path for c in repo.resume(agent_id).changes_since_fork()}
+            touched = tuple(sorted(set(co.status()) | pushed_before))
             pushed = co.push(f"{task.id}: {_first_line(tail) or task.description[:60]}")
             if pushed.status in ("blocked", "conflict", "contended"):
                 return WorkerResult(ERROR, summary=tail, touched=touched,
                                     error=f"push {pushed.status}: {sorted(pushed.conflicts)}")
-            return WorkerResult(DONE, summary=tail, commit=pushed.commit, touched=touched)
+            ws = repo.resume(agent_id)
+            commit = pushed.commit or (ws.head if ws.head != ws.fork_base else None)
+            return WorkerResult(DONE, summary=tail, commit=commit,
+                                touched=tuple(sorted({c.path for c in ws.changes_since_fork()})))
+
+    def _execute(self, argv, root, stdin, co, task) -> "subprocess.CompletedProcess":
+        if not self.checkpoint_every:
+            return subprocess.run(argv, cwd=root, input=stdin, capture_output=True, text=True,
+                                  timeout=self.timeout, env=self.env)
+        proc = subprocess.Popen(argv, cwd=root, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=self.env)
+        waited, pending = 0.0, stdin
+        while True:
+            try:
+                out, err = proc.communicate(input=pending, timeout=self.checkpoint_every)
+                return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+            except subprocess.TimeoutExpired:
+                pending = None
+                waited += self.checkpoint_every
+                if waited >= self.timeout:
+                    proc.kill()
+                    proc.communicate()
+                    raise
+                if co.status():
+                    co.push(f"{task.id}: checkpoint")      # a refused push (conflict) is simply tried again later
+
+
+def _prior_work(repo: Repository, agent_id: str) -> List[str]:
+    """Files an earlier attempt left on the branch (empty if the branch is new or untouched)."""
+    try:
+        ws = repo.resume(agent_id)
+    except NoSuchWorkspace:
+        return []
+    return sorted(c.path for c in ws.changes_since_fork())

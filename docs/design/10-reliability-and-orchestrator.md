@@ -99,12 +99,19 @@ Several orchestrators can serve one run at once; each task runs under exactly on
 
 ## Limits
 
-* A `CliWorker` has no checkpoints: after a crash its command is simply run again on whatever the branch
-  holds.
-* The fence stops a replaced owner from completing or landing, but it is checked before landing, not
-  atomically with it. Landing itself is safe (CAS plus validation); the cost of the race is duplicate
-  work, not a wrong main.
-* Task ids are global (branch `ws/<id>`, lease agent id): use fresh ids for each run.
+* A `CliWorker` cannot restore its command's internal state. With `checkpoint_every=SECONDS` it pushes the
+  files written so far at that interval, and a retry starts from them and is told in the prompt which files an
+  earlier attempt already changed; without it a failed command leaves the branch as it was. Only files are
+  saved, not what the agent was thinking.
+* The fence is checked twice: before landing starts, and again inside the validate step of `submit`, after
+  merging and just before the compare-and-set on main (`agents/fence.py`, a context variable set by the
+  scheduler around the landing call). A replaced owner is refused at once: no merger, no redo, no escalation.
+  The window between that check and the compare-and-set remains, because the store has no transaction across
+  the claim and main. What lands in that window was still merged and validated against the main it replaced,
+  so the cost of the race is duplicate work, not a wrong main.
+* Within a run the orchestrator names every task `RUN-TASK` (branch, lease, claim and session), so two runs
+  can reuse task names. Run ids are letters, digits and `_`, at most 32, and `RUN-TASK` must fit the 64
+  character id limit. Calling `Scheduler` directly still uses the bare task id.
 * Claim lifetime has to exceed the longest gap between heartbeats, or a slow machine loses its tasks
   needlessly. Clocks of orchestrators are assumed to agree to within a fraction of that lifetime.
 * The scheduler decides the order, not the claims: a restarted run with a different `parallel` is fine, a

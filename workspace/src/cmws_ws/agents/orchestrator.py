@@ -13,6 +13,7 @@ keep them off each other's tasks.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import time
 import uuid
@@ -24,7 +25,7 @@ from ..claims import TaskClaims
 from ..kv import KV
 from ..leases import LeaseTable
 from ..repo import Repository
-from .graph import TaskGraph
+from .graph import InvalidGraph, TaskGraph
 from .mergequeue import MergeQueue
 from .planner import Planner
 from .scheduler import DONE, RunReport, Scheduler
@@ -39,6 +40,19 @@ def task_to_dict(t: Task) -> dict:
 def task_from_dict(d: dict) -> Task:
     return Task(d["id"], d["description"], tuple(d.get("paths", ())), d.get("context", ""),
                 tuple(d.get("depends_on", ())))
+
+
+RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_]{0,31}$")
+
+
+def agent_id(run_id: str, task_id: str) -> str:
+    """Branch, lease and claim name of a task within a run: runs may reuse task names."""
+    return f"{run_id}-{task_id}"
+
+
+def namespaced(run_id: str, graph: TaskGraph) -> TaskGraph:
+    return TaskGraph([Task(agent_id(run_id, t.id), t.description, t.paths, t.context,
+                           tuple(agent_id(run_id, d) for d in t.depends_on)) for t in graph.tasks])
 
 
 def plan_key(run_id: str) -> str:
@@ -100,12 +114,20 @@ class Orchestrator:
         return TaskClaims(self.kv, ttl=self.claim_ttl, clock=self.clock, prefix=f"runs/{run_id}/")
 
     def run(self, run_id: str, goal: Optional[str] = None, graph: Optional[TaskGraph] = None) -> RunSummary:
+        if not RUN_ID.match(run_id):
+            raise ValueError(f"bad run id {run_id!r}: letters, digits and _, at most 32")
         graph, resumed = self.plan(run_id, goal, graph)
+        try:
+            graph = namespaced(run_id, graph)
+        except InvalidGraph as e:
+            raise ValueError(f"task names too long for run {run_id!r}: {e}") from e
         scheduler = Scheduler(self.repo, LeaseTable(self.kv, ttl=self.lease_ttl, clock=self.clock), self.worker,
                               parallel=self.parallel, land=self.queue.as_land(), lease_ttl=self.lease_ttl,
                               poll=self.poll, patience=self.patience, sleep=self._sleep,
                               claims=self.claims(run_id), owner=self.owner, claim_ttl=self.claim_ttl)
-        report = scheduler.run(graph)
+        raw = scheduler.run(graph)
+        cut = len(run_id) + 1
+        report = RunReport({t[cut:]: o for t, o in raw.outcomes.items()}, raw.max_concurrency)
         summary = RunSummary(run_id, report, resumed, self.repo.head(), report.by_status(DONE),
                              [t for t, o in report.outcomes.items() if o.status in ("failed", "rejected")],
                              report.by_status("skipped"))
@@ -116,7 +138,7 @@ class Orchestrator:
 
 
 def run_status(kv: KV, run_id: str) -> Dict[str, object]:
-    """What the store knows about a run: the plan, each task's claim state and the final result if any."""
+    """What the store knows about a run: the plan, the claim state of each task (keyed ``RUN-TASK``) and the result."""
     plan = kvdoc.load(kv, plan_key(run_id), None)
     return {"plan": plan, "claims": kvdoc.load(kv, f"runs/{run_id}/claims", {}),
             "result": kvdoc.load(kv, result_key(run_id), None)}

@@ -65,6 +65,10 @@ class TaskClaims:
             return e
         return None
 
+    def holds(self, task: str, owner: str, epoch: int) -> bool:
+        """Is the task still claimed by this owner at this epoch (taken over or completed means no)?"""
+        return self._mine(self.snapshot(), task, owner, epoch) is not None
+
     def renew(self, task: str, owner: str, epoch: int, ttl: Optional[float] = None) -> bool:
         """Extend our claim. Still possible after it ran out, as long as nobody took the task over."""
         expires = self.clock() + (self.ttl if ttl is None else ttl)

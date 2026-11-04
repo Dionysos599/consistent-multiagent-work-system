@@ -35,6 +35,7 @@ from ..history import commits_between
 from ..kv import KV
 from ..objects import Commit
 from ..repo import Repository, SubmitResult
+from . import fence
 from .worker import DONE, LoopWorker, Task, Worker, WorkerResult, run_task
 
 MARKER = re.compile(r"^(<<<<<<< |>>>>>>> )", re.M)
@@ -174,6 +175,9 @@ class MergeQueue:
     # ---- validating and landing one branch ----------------------------------------------
 
     def _validate(self, candidate: str) -> Optional[str]:
+        lost = fence.check()
+        if lost is not None:
+            return lost                                  # the claim moved on: do not let this land
         store = self.repo.store
         main = self.repo.head()
         files = self.repo.files_at(candidate)
@@ -192,11 +196,21 @@ class MergeQueue:
     def _try(self, agent_id: str, message: Optional[str]) -> SubmitResult:
         with self._lock:
             ws = self.repo.resume(agent_id)
-            return self.repo.submit(ws, message, validate=self._validate)
+            r = self.repo.submit(ws, message, validate=self._validate)
+        if r.status == "rejected" and r.detail == fence.LOST:
+            raise fence.ClaimLost()
+        return r
 
     # ---- the escalation chain -----------------------------------------------------------
 
     def land(self, task: Task, result: Optional[WorkerResult] = None, agent_id: Optional[str] = None) -> Landing:
+        try:
+            return self._land(task, result, agent_id)
+        except fence.ClaimLost:                           # stop at once: no merger, no redo, no escalation
+            return Landing("lost", branch=agent_id or task.id, detail=fence.LOST,
+                           steps=[Step("fence", "lost", fence.LOST)])
+
+    def _land(self, task: Task, result: Optional[WorkerResult], agent_id: Optional[str]) -> Landing:
         agent_id = agent_id or task.id
         summary = (result.summary.strip().splitlines()[0][:80] if result and result.summary.strip()
                    else task.description[:60])

@@ -94,6 +94,20 @@ class ClaimTests(unittest.TestCase):
         b = self.claims.claim("t", "B")
         self.assertEqual((b.status, b.epoch), (GRANTED, 2))
 
+    def test_holds_tells_whether_the_claim_is_still_ours(self):
+        self.assertFalse(self.claims.holds("t", "A", 1))                 # nothing claimed yet
+        e = self.claims.claim("t", "A").epoch
+        self.assertTrue(self.claims.holds("t", "A", e))
+        self.assertFalse(self.claims.holds("t", "B", e))
+        self.assertFalse(self.claims.holds("t", "A", e + 1))
+        self.clock.t += 500                                              # ran out, but nobody took it over
+        self.assertTrue(self.claims.holds("t", "A", e))
+        self.claims.claim("t", "B")
+        self.assertFalse(self.claims.holds("t", "A", e))
+        self.assertTrue(self.claims.holds("t", "B", e + 1))
+        self.claims.complete("t", "B", e + 1, {})
+        self.assertFalse(self.claims.holds("t", "B", e + 1))
+
     def test_claims_are_per_task_and_per_prefix(self):
         self.assertEqual(self.claims.claim("t", "A").status, GRANTED)
         self.assertEqual(self.claims.claim("u", "B").status, GRANTED)
@@ -467,6 +481,81 @@ class DurableWorkerTests(unittest.TestCase):
         self.assertEqual(doc["state"]["step"], 2)
 
 
+# ---- command-line worker -----------------------------------------------------------------------------
+
+import sys
+
+from cmws_ws.agents import CliWorker
+
+READ_PROMPT = "import sys,pathlib;pathlib.Path('prompt.txt').write_text(sys.stdin.read())"
+SLOW_CRASH = ("import pathlib,sys,time;pathlib.Path('part.txt').write_text('half');time.sleep(1.0);"
+              "pathlib.Path('rest.txt').write_text('never');sys.exit(3)")
+
+
+class CliWorkerRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = fresh_repo()
+        self.task = Task("c1", "make files", ())
+
+    def run_worker(self, code, **kw):
+        self.repo.fork("c1") if self.repo.refs.get("ws/c1") is None else None
+        return CliWorker([sys.executable, "-c", code], **kw).run(self.task, self.repo, "c1")
+
+    def test_a_retry_is_told_what_the_branch_already_holds(self):
+        ws = self.repo.fork("c1")
+        ws.write("done.txt", "earlier")
+        ws.commit("earlier attempt")
+        res = self.run_worker(READ_PROMPT + ";pathlib.Path('new.txt').write_text('n')")
+        self.assertTrue(res.ok, res.error)
+        prompt = self.repo.resume("c1").read_text("prompt.txt")
+        self.assertIn("earlier attempt", prompt)
+        self.assertIn("done.txt", prompt)
+        self.assertEqual(res.touched, ("done.txt", "new.txt", "prompt.txt"))
+        self.assertEqual(res.commit, self.repo.resume("c1").head)
+
+    def test_a_first_attempt_gets_no_such_note(self):
+        res = self.run_worker(READ_PROMPT)
+        self.assertNotIn("earlier attempt", self.repo.resume("c1").read_text("prompt.txt"))
+        self.assertTrue(res.ok)
+
+    def test_an_untouched_branch_is_not_reported_as_prior_work(self):
+        self.repo.fork("c1")
+        res = self.run_worker("pass")
+        self.assertEqual((res.status, res.commit, res.touched), ("done", None, ()))
+
+    def test_progress_is_pushed_while_the_command_runs(self):
+        res = self.run_worker(SLOW_CRASH, checkpoint_every=0.2)
+        self.assertEqual(res.status, "error")
+        ws = self.repo.resume("c1")
+        self.assertEqual(ws.read_text("part.txt"), "half")                # kept although the command failed
+        self.assertFalse(ws.exists("rest.txt"))
+
+    def test_without_checkpoints_a_failed_command_leaves_nothing(self):
+        res = self.run_worker(SLOW_CRASH)
+        self.assertEqual(res.status, "error")
+        self.assertFalse(self.repo.resume("c1").exists("part.txt"))
+
+    def test_a_timeout_keeps_the_progress_and_stops_the_command(self):
+        code = "import pathlib,time;pathlib.Path('part.txt').write_text('half');time.sleep(30)"
+        t0 = time.time()
+        res = self.run_worker(code, checkpoint_every=0.2, timeout=0.5)
+        self.assertLess(time.time() - t0, 10)
+        self.assertEqual((res.status, res.error), ("error", "timed out after 0s"))
+        self.assertEqual(self.repo.resume("c1").read_text("part.txt"), "half")
+
+    def test_a_successful_checkpointed_run_lands_one_result(self):
+        code = READ_PROMPT + ";import time;time.sleep(0.5);pathlib.Path('z.txt').write_text('z')"
+        res = self.run_worker(code, checkpoint_every=0.2)
+        self.assertTrue(res.ok, res.error)
+        self.assertEqual(res.touched, ("prompt.txt", "z.txt"))
+        ws = self.repo.resume("c1")
+        self.assertEqual((ws.read_text("z.txt"), res.commit), ("z", ws.head))
+
+    def test_stdin_is_delivered_even_when_checkpointing(self):
+        res = self.run_worker("import sys;print(len(sys.stdin.read()) > 10)", checkpoint_every=0.2)
+        self.assertEqual(res.summary, "True")
+
+
 # ---- orchestrator -----------------------------------------------------------------------------------
 
 class FnWorker:
@@ -477,6 +566,8 @@ class FnWorker:
         self.lock = threading.Lock()
 
     def run(self, task, repo, agent_id):
+        if "-" in task.id:                                    # the orchestrator names tasks RUN-TASK
+            task = Task(task.id.split("-", 1)[1], task.description, task.paths)
         with self.lock:
             self.runs.append(task.id)
         if task.id in self.fail:
@@ -512,12 +603,39 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(sorted(repo.main_files()), ["README", "a.txt", "b.txt", "c.txt"])
         st = run_status(repo.kv, "r1")
         self.assertEqual([t["id"] for t in st["plan"]["tasks"]], ["a", "b", "c"])
-        self.assertEqual({t: c["state"] for t, c in st["claims"].items()}, {"a": "completed", "b": "completed", "c": "completed"})
-        self.assertEqual(st["result"]["landed"], ["a", "b", "c"])
+        self.assertEqual({t: c["state"] for t, c in st["claims"].items()},
+                         {"r1-a": "completed", "r1-b": "completed", "r1-c": "completed"})
+        self.assertEqual(sorted(st["result"]["landed"]), ["a", "b", "c"])
         self.assertEqual(st["result"]["main"], repo.head())
         self.assertIsNotNone(repo.kv.get("runs/r1/plan"))
         self.assertIsNotNone(repo.kv.get("runs/r1/result"))
         self.assertEqual(out.main, repo.head())
+
+    def test_two_runs_may_reuse_task_names(self):
+        def fn(task, ws):
+            ws.write(f"{ws.agent_id}.txt", "x")
+        repo, orch = self.make(FnWorker(fn))
+        a = orch.run("r1", graph=graph(("a", ["r1-a.txt"], [])))
+        self.assertTrue(a.ok)
+        b = Orchestrator(repo, FnWorker(fn), owner="o2", poll=0.01).run("r2", graph=graph(("a", ["r2-a.txt"], [])))
+        self.assertTrue(b.ok, b.report.outcomes)
+        self.assertEqual(sorted(repo.main_files()), ["README", "r1-a.txt", "r2-a.txt"])
+        self.assertIsNotNone(repo.refs.get("ws/r1-a"))
+        self.assertIsNotNone(repo.refs.get("ws/r2-a"))
+
+    def test_bad_run_ids_and_overlong_names_are_refused(self):
+        repo, orch = self.make(FnWorker())
+        for bad in ("", "a-b", "x" * 33, "../x", "a b"):
+            with self.assertRaises(ValueError):
+                orch.run(bad, graph=graph(("a", [], [])))
+        with self.assertRaises(ValueError):
+            orch.run("r1", graph=graph(("t" * 62, [], [])))
+        orch.run("x" * 32, graph=graph(("t" * 31, [], [])))        # exactly at the limits is fine
+
+    def test_dependencies_are_renamed_along_with_tasks(self):
+        repo, orch = self.make(FnWorker())
+        out = orch.run("r1", graph=graph(*G3))
+        self.assertEqual(out.report.outcomes["c"].task.depends_on, ("r1-a", "r1-b"))
 
     def test_the_planner_is_asked_once_and_the_plan_is_stored(self):
         asked = []
@@ -612,8 +730,8 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaises(Crash):
             orch.run("r1", graph=graph(*G3))
         snap = TaskClaims(repo.kv, prefix="runs/r1/").snapshot()
-        self.assertEqual((snap["a"]["state"], snap["b"]["state"]), ("completed", "claimed"))
-        self.assertNotIn("c", snap)
+        self.assertEqual((snap["r1-a"]["state"], snap["r1-b"]["state"]), ("completed", "claimed"))
+        self.assertNotIn("r1-c", snap)
         # the dead owner's claim is still live: a second orchestrator must not touch task b
         w2 = FnWorker(fn)
         busy = Orchestrator(repo, w2, owner="o2", clock=clock, claim_ttl=100, poll=0.01, patience=0.2).run("r1")
@@ -628,7 +746,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(done.ok, done.report.outcomes)
         self.assertEqual(sorted(repo.main_files()), ["README", "a.txt", "b.txt", "c.txt"])
         self.assertEqual(repo.main_files()["b.txt"], b"b")
-        self.assertEqual(TaskClaims(repo.kv, prefix="runs/r1/").snapshot()["b"]["epoch"], 2)
+        self.assertEqual(TaskClaims(repo.kv, prefix="runs/r1/").snapshot()["r1-b"]["epoch"], 2)
 
     def test_a_durable_worker_resumes_inside_the_orchestrator(self):
         clock = Clock()
@@ -660,7 +778,7 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(o1.run("r", graph=graph(("t", ["f.txt"], []))).ok)
         main = repo.head()
         doc = TaskClaims(repo.kv, prefix="runs/r/").snapshot()          # forget that it completed
-        doc["t"] = {"state": "claimed", "owner": "o1", "epoch": 1, "expires": clock.t + 1}
+        doc["r-t"] = {"state": "claimed", "owner": "o1", "epoch": 1, "expires": clock.t + 1}
         repo.kv.put("runs/r/claims", json.dumps(doc))
         clock.t += 100
         silent = ScriptedModel([])
@@ -713,7 +831,98 @@ class OrchestratorTests(unittest.TestCase):
 
 # ---- scheduler claims -------------------------------------------------------------------------------
 
+class FenceTests(unittest.TestCase):
+    def test_the_fence_is_scoped_and_nests(self):
+        from cmws_ws.agents import fence
+        self.assertIsNone(fence.check())
+        with fence.fenced(lambda: "outer"):
+            self.assertEqual(fence.check(), "outer")
+            with fence.fenced(lambda: None):
+                self.assertIsNone(fence.check())
+            self.assertEqual(fence.check(), "outer")
+        self.assertIsNone(fence.check())
+
+    def test_the_fence_is_per_thread(self):
+        from cmws_ws.agents import fence
+        seen = []
+        with fence.fenced(lambda: "mine"):
+            t = threading.Thread(target=lambda: seen.append(fence.check()))
+            t.start()
+            t.join()
+        self.assertEqual(seen, [None])
+
+    def test_a_fenced_queue_refuses_at_once_without_escalating(self):
+        from cmws_ws.agents import MergeQueue, fence
+        repo = Repository.init(MemoryKV(), {"README": "x"})
+        ws = repo.fork("t")
+        ws.write("t.txt", "t")
+        ws.commit("t")
+        asked = []
+
+        class Merger:
+            name = "m"
+
+            def run(self, *a):
+                asked.append(1)
+
+        queue = MergeQueue(repo, merger=Merger(), redo_worker=Merger())
+        before = repo.head()
+        with fence.fenced(lambda: fence.LOST):
+            landing = queue.land(Task("t", "d", ()))
+        self.assertEqual((landing.status, landing.detail, [(x.stage, x.status) for x in landing.steps]),
+                         ("lost", fence.LOST, [("fence", "lost")]))
+        self.assertEqual((repo.head(), asked, queue.escalations.list(), queue.approved), (before, [], [], []))
+        with fence.fenced(lambda: None):
+            self.assertTrue(queue.land(Task("t", "d", ())).landed)         # an unfenced landing is unaffected
+
+
 class SchedulerClaimTests(unittest.TestCase):
+    def _steal_during_landing(self, make_land):
+        repo = Repository.init(MemoryKV(), {"README": "x"})
+        clock = Clock()
+        claims = TaskClaims(repo.kv, ttl=10, clock=clock, prefix="p/")
+        before = repo.head()
+        stolen = []
+
+        def steal():
+            clock.t += 11
+            stolen.append(claims.claim("s", "new").epoch)               # after the scheduler's own check
+            LeaseTable(repo.kv, clock=clock).acquire("s", ["s.txt"])    # and the new owner's lease (same key)
+
+        sch = Scheduler(repo, LeaseTable(repo.kv, clock=clock), FnWorker(), claims=claims, owner="old", poll=0.01,
+                        land=make_land(repo, steal), heartbeat=1000, lease_ttl=5, claim_ttl=10)
+        report = sch.run(graph(("s", ["s.txt"], [])))
+        out = report.outcomes["s"]
+        self.assertEqual((out.status, out.reason), ("failed", "claim lost to another owner"))
+        self.assertEqual((stolen, repo.head()), ([2], before))              # main did not move
+        self.assertEqual(claims.snapshot()["s"]["owner"], "new")
+        self.assertIn("s", LeaseTable(repo.kv, clock=clock).holders())      # the old owner did not release it
+        return repo
+
+    def test_a_claim_taken_over_just_before_landing_stops_a_direct_landing(self):
+        from cmws_ws.agents.scheduler import land_directly
+
+        def make(repo, steal):
+            return lambda r, task, result: (steal(), land_directly(r, task, result))[1]
+        repo = self._steal_during_landing(make)
+        self.assertEqual(repo.refs.get("ws/s") is not None, True)           # the work is still on its branch
+
+    def test_a_claim_taken_over_just_before_landing_stops_the_merge_queue(self):
+        from cmws_ws.agents import MergeQueue
+
+        class Boom:
+            name = "boom"
+
+            def run(self, *a):
+                raise AssertionError("no merger or redo for a lost claim")
+
+        def make(repo, steal):
+            q = MergeQueue(repo, merger=Boom(), redo_worker=Boom())
+            return lambda r, task, result: (steal(), q.land(task, result))[1]
+        repo = self._steal_during_landing(make)
+        self.assertEqual(repo.kv.get("mq/escalations"), None)
+
+
     def test_heartbeat_keeps_a_slow_task_alive(self):
         repo = Repository.init(MemoryKV(), {"README": "x"})
         claims = TaskClaims(repo.kv, ttl=0.25, clock=time.time, prefix="p/")

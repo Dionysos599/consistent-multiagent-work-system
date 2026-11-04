@@ -179,7 +179,7 @@ def main(argv=None) -> int:
             return 1
         print("goal:", st["plan"]["goal"])
         for t in st["plan"]["tasks"]:
-            c = st["claims"].get(t["id"], {})
+            c = st["claims"].get(f"{a.run_id}-{t['id']}", {})
             state = c.get("outcome", {}).get("status", c.get("state", "pending")) if c else "pending"
             print(f"  {t['id']:20} {state:10} {c.get('owner', '')}")
         if st["result"]:
